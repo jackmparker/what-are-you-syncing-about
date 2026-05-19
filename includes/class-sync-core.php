@@ -913,6 +913,7 @@ class SYNC_Core {
 		$table_sizes = array();
 		if ( $size_rows ) {
 			foreach ( $size_rows as $row ) {
+				$row = array_change_key_case( $row, CASE_LOWER );
 				$table_sizes[ $row['table_name'] ] = (int) $row['total_bytes'];
 			}
 		}

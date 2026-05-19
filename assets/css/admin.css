@@ -96,6 +96,27 @@
 	color: #d63638;
 }
 
+/* File sync options */
+.sync-file-options {
+	display: flex;
+	flex-direction: column;
+	gap: 8px;
+	margin-bottom: 15px;
+}
+
+.sync-file-options label {
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	font-size: 13px;
+	color: #1d2327;
+	cursor: pointer;
+}
+
+.sync-file-options input[type="checkbox"] {
+	margin: 0;
+}
+
 /* Migration Actions */
 .migration-actions {
 	display: flex;

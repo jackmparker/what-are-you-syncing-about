@@ -13,6 +13,7 @@ class SYNC_Ajax {
 
 	private static $instance = null;
 	private $core;
+	private $files;
 
 	/**
 	 * Get singleton instance
@@ -30,7 +31,8 @@ class SYNC_Ajax {
 	 * Constructor
 	 */
 	private function __construct() {
-		$this->core = SYNC_Core::get_instance();
+		$this->core  = SYNC_Core::get_instance();
+		$this->files = SYNC_Files::get_instance();
 
 		// Send CORS headers immediately if this is an AJAX request for our plugin
 		$this->maybe_send_cors_now();
@@ -75,6 +77,20 @@ class SYNC_Ajax {
 		// Export a batch of small tables in one request
 		add_action( 'wp_ajax_sync_export_batch', array( $this, 'ajax_export_batch' ) );
 		add_action( 'wp_ajax_nopriv_sync_export_batch', array( $this, 'ajax_export_batch' ) );
+
+		// File sync: inventory, plugins ZIP, upload chunks
+		add_action( 'wp_ajax_sync_get_file_inventory', array( $this, 'ajax_get_file_inventory' ) );
+		add_action( 'wp_ajax_nopriv_sync_get_file_inventory', array( $this, 'ajax_get_file_inventory' ) );
+		add_action( 'wp_ajax_sync_export_zip_chunk', array( $this, 'ajax_export_zip_chunk' ) );
+		add_action( 'wp_ajax_nopriv_sync_export_zip_chunk', array( $this, 'ajax_export_zip_chunk' ) );
+		add_action( 'wp_ajax_sync_import_zip_chunk', array( $this, 'ajax_import_zip_chunk' ) );
+		add_action( 'wp_ajax_nopriv_sync_import_zip_chunk', array( $this, 'ajax_import_zip_chunk' ) );
+		add_action( 'wp_ajax_sync_finalize_plugins', array( $this, 'ajax_finalize_plugins' ) );
+		add_action( 'wp_ajax_nopriv_sync_finalize_plugins', array( $this, 'ajax_finalize_plugins' ) );
+		add_action( 'wp_ajax_sync_export_upload_chunk', array( $this, 'ajax_export_upload_chunk' ) );
+		add_action( 'wp_ajax_nopriv_sync_export_upload_chunk', array( $this, 'ajax_export_upload_chunk' ) );
+		add_action( 'wp_ajax_sync_import_upload_chunk', array( $this, 'ajax_import_upload_chunk' ) );
+		add_action( 'wp_ajax_nopriv_sync_import_upload_chunk', array( $this, 'ajax_import_upload_chunk' ) );
 	}
 
 	/**
@@ -958,6 +974,187 @@ class SYNC_Ajax {
 		}
 
 		$this->send_response( $response_data );
+	}
+
+	// ── File sync handlers ────────────────────────────────────────────────────────
+
+	/**
+	 * Return a file inventory (path → hash + size) for uploads or plugins dir.
+	 * Called on both local (nonce) and remote (signature) sides.
+	 */
+	public function ajax_get_file_inventory() {
+		if ( ! $this->authenticate_request() ) {
+			return;
+		}
+
+		@ini_set( 'memory_limit', '512M' );
+		@set_time_limit( 300 );
+
+		$dir_type = isset( $_POST['dir_type'] ) ? sanitize_text_field( $_POST['dir_type'] ) : '';
+		if ( ! in_array( $dir_type, array( 'uploads', 'plugins' ), true ) ) {
+			$this->send_error( 'Invalid dir_type', 'invalid_params' );
+			return;
+		}
+
+		$inventory = $this->files->get_file_inventory( $dir_type );
+
+		$this->send_response( array(
+			'success'   => true,
+			'inventory' => $inventory,
+		) );
+	}
+
+	/**
+	 * Create the plugins ZIP (on offset=0 / no zip_id) and return the next chunk.
+	 * Called on the source site (remote for pull, local for push).
+	 */
+	public function ajax_export_zip_chunk() {
+		$this->maybe_send_cors_headers();
+
+		if ( ! $this->authenticate_request() ) {
+			return;
+		}
+
+		$zip_id = isset( $_POST['zip_id'] ) ? sanitize_text_field( $_POST['zip_id'] ) : '';
+		$offset = isset( $_POST['offset'] ) ? (int) $_POST['offset'] : 0;
+
+		@ini_set( 'memory_limit', '512M' );
+		@set_time_limit( 600 );
+
+		// Create ZIP on first call
+		if ( 0 === $offset && empty( $zip_id ) ) {
+			$zip_id = $this->files->create_plugins_zip();
+			if ( is_wp_error( $zip_id ) ) {
+				$this->send_error( $zip_id->get_error_message(), $zip_id->get_error_code() );
+				return;
+			}
+		}
+
+		$result = $this->files->export_zip_chunk( $zip_id, $offset );
+		if ( is_wp_error( $result ) ) {
+			$this->send_error( $result->get_error_message(), $result->get_error_code() );
+			return;
+		}
+
+		$this->send_response( array_merge( array( 'success' => true ), $result ) );
+	}
+
+	/**
+	 * Receive a chunk of the incoming plugins ZIP.
+	 * Called on the destination site (local for pull, remote for push).
+	 */
+	public function ajax_import_zip_chunk() {
+		if ( ! $this->authenticate_request() ) {
+			return;
+		}
+
+		@ini_set( 'memory_limit', '256M' );
+		@set_time_limit( 300 );
+
+		$zip_id   = isset( $_POST['zip_id'] ) ? sanitize_text_field( $_POST['zip_id'] ) : '';
+		$data_b64 = isset( $_POST['data'] ) ? wp_unslash( $_POST['data'] ) : '';
+
+		if ( empty( $zip_id ) || '' === $data_b64 ) {
+			$this->send_error( 'Missing parameters', 'missing_params' );
+			return;
+		}
+
+		$result = $this->files->import_zip_chunk( $zip_id, $data_b64 );
+		if ( is_wp_error( $result ) ) {
+			$this->send_error( $result->get_error_message(), $result->get_error_code() );
+			return;
+		}
+
+		$this->send_response( array( 'success' => true ) );
+	}
+
+	/**
+	 * Extract the assembled plugins ZIP into wp-content/plugins.
+	 * Called on the destination site after all chunks received.
+	 */
+	public function ajax_finalize_plugins() {
+		if ( ! $this->authenticate_request() ) {
+			return;
+		}
+
+		@ini_set( 'memory_limit', '512M' );
+		@set_time_limit( 600 );
+
+		$zip_id = isset( $_POST['zip_id'] ) ? sanitize_text_field( $_POST['zip_id'] ) : '';
+
+		if ( empty( $zip_id ) ) {
+			$this->send_error( 'Missing zip_id', 'missing_params' );
+			return;
+		}
+
+		$result = $this->files->finalize_plugins_zip( $zip_id );
+		if ( is_wp_error( $result ) ) {
+			$this->send_error( $result->get_error_message(), $result->get_error_code() );
+			return;
+		}
+
+		$this->send_response( array( 'success' => true ) );
+	}
+
+	/**
+	 * Return a binary chunk of a specific uploads file.
+	 * Called on the source site.
+	 */
+	public function ajax_export_upload_chunk() {
+		$this->maybe_send_cors_headers();
+
+		if ( ! $this->authenticate_request() ) {
+			return;
+		}
+
+		$relative_path = isset( $_POST['relative_path'] ) ? wp_unslash( $_POST['relative_path'] ) : '';
+		$offset        = isset( $_POST['offset'] ) ? (int) $_POST['offset'] : 0;
+
+		if ( '' === $relative_path ) {
+			$this->send_error( 'Missing relative_path', 'missing_params' );
+			return;
+		}
+
+		@ini_set( 'memory_limit', '256M' );
+		@set_time_limit( 300 );
+
+		$result = $this->files->export_upload_chunk( $relative_path, $offset );
+		if ( is_wp_error( $result ) ) {
+			$this->send_error( $result->get_error_message(), $result->get_error_code() );
+			return;
+		}
+
+		$this->send_response( array_merge( array( 'success' => true ), $result ) );
+	}
+
+	/**
+	 * Receive a chunk of an uploads file; finalize (move to final path) on last chunk.
+	 * Called on the destination site.
+	 */
+	public function ajax_import_upload_chunk() {
+		if ( ! $this->authenticate_request() ) {
+			return;
+		}
+
+		@ini_set( 'memory_limit', '256M' );
+		@set_time_limit( 300 );
+
+		$relative_path = isset( $_POST['relative_path'] ) ? wp_unslash( $_POST['relative_path'] ) : '';
+		$data_b64      = isset( $_POST['data'] ) ? wp_unslash( $_POST['data'] ) : '';
+		$is_last       = ! empty( $_POST['is_last'] );
+
+		if ( '' === $relative_path || '' === $data_b64 ) {
+			$this->send_error( 'Missing parameters', 'missing_params' );
+			return;
+		}
+
+		$result = $this->files->import_upload_chunk( $relative_path, $data_b64, $is_last );
+		if ( is_wp_error( $result ) ) {
+			$this->send_error( $result->get_error_message(), $result->get_error_code() );
+			return;
+		}
+
+		$this->send_response( array( 'success' => true ) );
 	}
 }
 

@@ -121,12 +121,22 @@ $concurrency     = isset( $settings['concurrency'] ) ? (int) $settings['concurre
 			<p class="description">
 				<?php echo esc_html__( 'Pull database from remote site or push database to remote site.', 'what-are-you-syncing-about' ); ?>
 			</p>
+			<div class="sync-file-options">
+				<label>
+					<input type="checkbox" id="sync-plugins" />
+					<?php echo esc_html__( 'Sync plugins (wp-content/plugins)', 'what-are-you-syncing-about' ); ?>
+				</label>
+				<label>
+					<input type="checkbox" id="sync-uploads" />
+					<?php echo esc_html__( 'Sync uploads (wp-content/uploads, skips unchanged files)', 'what-are-you-syncing-about' ); ?>
+				</label>
+			</div>
 			<div class="migration-actions">
 				<button type="button" id="pull-database-btn" class="button button-primary button-large" disabled>
-					<?php echo esc_html__( 'Pull Database', 'what-are-you-syncing-about' ); ?>
+					<?php echo esc_html__( 'Pull', 'what-are-you-syncing-about' ); ?>
 				</button>
 				<button type="button" id="push-database-btn" class="button button-primary button-large" disabled>
-					<?php echo esc_html__( 'Push Database', 'what-are-you-syncing-about' ); ?>
+					<?php echo esc_html__( 'Push', 'what-are-you-syncing-about' ); ?>
 				</button>
 			</div>
 		</div>

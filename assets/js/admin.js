@@ -90,13 +90,22 @@
 			const lower = key.toLowerCase();
 			if (lower === 'key' || lower === 'sig' || lower === 'nonce') {
 				out[key] = '[redacted]';
-			} else if ((lower === 'sql' || lower === 'sql_b64' || lower === 'sql_gz_b64') && typeof data[key] === 'string') {
+			} else if (
+				(lower === 'sql' || lower === 'sql_b64' || lower === 'sql_gz_b64' || lower === 'data') &&
+				typeof data[key] === 'string'
+			) {
 				out[key] = '[' + key + ' ' + data[key].length + ' chars]';
 			} else {
 				out[key] = sanitizeForLog(data[key]);
 			}
 		}
 		return out;
+	}
+
+	function formatBytes(bytes) {
+		if (bytes < 1024) return bytes + ' B';
+		if (bytes < 1048576) return Math.round(bytes / 1024) + ' KB';
+		return (bytes / 1048576).toFixed(1) + ' MB';
 	}
 
 	function clearLog() {
@@ -418,7 +427,15 @@
 			return;
 		}
 
+		const syncPluginsEl = document.getElementById('sync-plugins');
+		const syncUploadsEl = document.getElementById('sync-uploads');
+		const doSyncPlugins = syncPluginsEl && syncPluginsEl.checked;
+		const doSyncUploads = syncUploadsEl && syncUploadsEl.checked;
+
 		log('Starting ' + type + ' migration → ' + remoteUrl, 'info');
+		if (doSyncPlugins) log('Plugins sync: enabled', 'info');
+		if (doSyncUploads) log('Uploads sync: enabled', 'info');
+
 		migrationInProgress = true;
 		hideError();
 		hideWarning();
@@ -434,6 +451,11 @@
 				await pullDatabase();
 			} else {
 				await pushDatabase();
+			}
+
+			if (doSyncPlugins || doSyncUploads) {
+				hideSuccess();
+				await syncFiles(type, doSyncPlugins, doSyncUploads);
 			}
 		} catch (error) {
 			log('Migration failed: ' + (error.message || 'unknown error'), 'error');
@@ -875,6 +897,336 @@
 			logObject('Remote response body', json, 'error');
 		}
 		return json;
+	}
+
+	// ── File sync orchestration ───────────────────────────────────────────────
+
+	async function syncFiles(type, syncPlugins, syncUploads) {
+		const remoteAjaxUrl = remoteUrl + '/wp-admin/admin-ajax.php';
+
+		if (syncPlugins) {
+			log('File sync: plugins phase (' + type + ')', 'info');
+			showProgress(0, 'Syncing plugins...');
+			if (type === 'pull') {
+				await pullPlugins(remoteAjaxUrl);
+			} else {
+				await pushPlugins(remoteAjaxUrl);
+			}
+		}
+
+		if (syncUploads) {
+			log('File sync: uploads phase (' + type + ')', 'info');
+			showProgress(0, 'Scanning uploads...');
+			if (type === 'pull') {
+				await pullUploads(remoteAjaxUrl);
+			} else {
+				await pushUploads(remoteAjaxUrl);
+			}
+		}
+
+		showProgress(100, 'File sync complete!');
+		showSuccess('Migration and file sync completed successfully!');
+	}
+
+	// ── Plugins sync ──────────────────────────────────────────────────────────
+
+	/**
+	 * Pull: remote creates ZIP, browser fetches chunks → imports locally → finalize locally.
+	 */
+	async function pullPlugins(remoteAjaxUrl) {
+		let zipId = null;
+		let offset = 0;
+		let done = false;
+		let totalSize = 0;
+
+		log('Plugins pull: creating ZIP on remote', 'info');
+
+		while (!done) {
+			const payload = { action: 'sync_export_zip_chunk', key: remoteKey, offset: offset };
+			if (zipId) payload.zip_id = zipId;
+
+			const exportResult = await withRetry(function() { return remoteRequest(remoteAjaxUrl, payload, remoteKey); });
+			if (!exportResult.success) {
+				throw new Error(exportResult.error || 'Plugin ZIP export failed');
+			}
+
+			zipId      = exportResult.zip_id;
+			totalSize  = exportResult.total_size || totalSize;
+			done       = exportResult.done;
+			const nextOffset = exportResult.next_offset;
+
+			const importReq = { action: 'sync_import_zip_chunk', zip_id: zipId, data: exportResult.data };
+			const importSig = await createSignature(importReq, connectionKey);
+			importReq.nonce = nonce;
+			importReq.sig   = importSig;
+
+			const importResult = await withRetry(function() { return localPost(importReq); });
+			if (!importResult.success) {
+				throw new Error(importResult.error || 'Plugin ZIP import failed');
+			}
+
+			if (totalSize > 0) {
+				showProgress(Math.round((nextOffset / totalSize) * 90), 'Syncing plugins (' + formatBytes(nextOffset) + ' / ' + formatBytes(totalSize) + ')...');
+			}
+			offset = nextOffset;
+		}
+
+		log('Plugins pull: finalizing locally', 'info');
+		const finalizeReq = { action: 'sync_finalize_plugins', zip_id: zipId };
+		const finalizeSig = await createSignature(finalizeReq, connectionKey);
+		finalizeReq.nonce = nonce;
+		finalizeReq.sig   = finalizeSig;
+
+		const finalizeResult = await localPost(finalizeReq);
+		if (!finalizeResult.success) {
+			throw new Error(finalizeResult.error || 'Plugin finalization failed');
+		}
+
+		log('Plugins pull complete', 'success');
+		showProgress(100, 'Plugins synced!');
+	}
+
+	/**
+	 * Push: local creates ZIP, browser fetches chunks → imports on remote → finalize remote.
+	 */
+	async function pushPlugins(remoteAjaxUrl) {
+		let zipId = null;
+		let offset = 0;
+		let done = false;
+		let totalSize = 0;
+
+		log('Plugins push: creating ZIP locally', 'info');
+
+		while (!done) {
+			const exportReq = { action: 'sync_export_zip_chunk', key: remoteKey, offset: offset };
+			if (zipId) exportReq.zip_id = zipId;
+			const exportSig = await createSignature(exportReq, connectionKey);
+			exportReq.nonce = nonce;
+			exportReq.sig   = exportSig;
+
+			const exportResult = await withRetry(function() { return localPost(exportReq); });
+			if (!exportResult.success) {
+				throw new Error(exportResult.error || 'Plugin ZIP export failed');
+			}
+
+			zipId     = exportResult.zip_id;
+			totalSize = exportResult.total_size || totalSize;
+			done      = exportResult.done;
+			const nextOffset = exportResult.next_offset;
+
+			const importResult = await withRetry(function() {
+				return remoteRequest(remoteAjaxUrl, {
+					action: 'sync_import_zip_chunk',
+					key: remoteKey,
+					zip_id: zipId,
+					data: exportResult.data
+				}, remoteKey);
+			});
+			if (!importResult.success) {
+				throw new Error(importResult.error || 'Plugin ZIP import failed');
+			}
+
+			if (totalSize > 0) {
+				showProgress(Math.round((nextOffset / totalSize) * 90), 'Syncing plugins (' + formatBytes(nextOffset) + ' / ' + formatBytes(totalSize) + ')...');
+			}
+			offset = nextOffset;
+		}
+
+		log('Plugins push: finalizing on remote', 'info');
+		const finalizeResult = await remoteRequest(remoteAjaxUrl, {
+			action: 'sync_finalize_plugins',
+			key: remoteKey,
+			zip_id: zipId
+		}, remoteKey);
+		if (!finalizeResult.success) {
+			throw new Error(finalizeResult.error || 'Plugin finalization failed');
+		}
+
+		log('Plugins push complete', 'success');
+		showProgress(100, 'Plugins synced!');
+	}
+
+	// ── Uploads sync ──────────────────────────────────────────────────────────
+
+	/**
+	 * Compute relative paths present in sourceInv but absent or hash-changed in destInv.
+	 */
+	function diffInventories(sourceInv, destInv) {
+		const toTransfer = [];
+		for (const path of Object.keys(sourceInv)) {
+			const srcInfo = sourceInv[path];
+			const srcHash = srcInfo && typeof srcInfo === 'object' ? srcInfo.hash : srcInfo;
+			if (!destInv[path]) {
+				toTransfer.push(path);
+			} else {
+				const dstInfo = destInv[path];
+				const dstHash = dstInfo && typeof dstInfo === 'object' ? dstInfo.hash : dstInfo;
+				if (srcHash !== dstHash) {
+					toTransfer.push(path);
+				}
+			}
+		}
+		return toTransfer;
+	}
+
+	async function getLocalInventory(dirType) {
+		const req = { action: 'sync_get_file_inventory', key: remoteKey, dir_type: dirType };
+		const sig = await createSignature(req, connectionKey);
+		req.nonce = nonce;
+		req.sig   = sig;
+		const result = await withRetry(function() { return localPost(req); });
+		if (!result.success) {
+			throw new Error(result.error || 'Failed to get local ' + dirType + ' inventory');
+		}
+		return result.inventory || {};
+	}
+
+	async function getRemoteInventory(remoteAjaxUrl, dirType) {
+		const result = await withRetry(function() {
+			return remoteRequest(remoteAjaxUrl, {
+				action: 'sync_get_file_inventory',
+				key: remoteKey,
+				dir_type: dirType
+			}, remoteKey);
+		});
+		if (!result.success) {
+			throw new Error(result.error || 'Failed to get remote ' + dirType + ' inventory');
+		}
+		return result.inventory || {};
+	}
+
+	async function transferUploadFiles(files, sourceInv, fetchChunk, importChunk) {
+		const totalBytes = files.reduce(function(sum, path) {
+			const info = sourceInv[path];
+			return sum + (info && info.size ? info.size : 0);
+		}, 0);
+
+		log('Uploads: ' + files.length + ' files to transfer (' + formatBytes(totalBytes) + ')', 'info');
+
+		if (files.length === 0) {
+			showProgress(100, 'Uploads up to date, nothing to transfer.');
+			return;
+		}
+
+		let bytesTransferred = 0;
+
+		for (const relativePath of files) {
+			let offset = 0;
+			let done = false;
+
+			while (!done) {
+				const exportResult = await withRetry(function() { return fetchChunk(relativePath, offset); });
+				if (!exportResult.success) {
+					throw new Error(exportResult.error || 'Upload export failed: ' + relativePath);
+				}
+
+				done = exportResult.done;
+
+				const importResult = await withRetry(function() { return importChunk(relativePath, exportResult.data, done); });
+				if (!importResult.success) {
+					throw new Error(importResult.error || 'Upload import failed: ' + relativePath);
+				}
+
+				const chunkBytes = exportResult.next_offset - offset;
+				bytesTransferred += chunkBytes;
+				offset = exportResult.next_offset;
+
+				if (totalBytes > 0) {
+					showProgress(
+						10 + Math.round((bytesTransferred / totalBytes) * 85),
+						'Syncing uploads (' + formatBytes(bytesTransferred) + ' / ' + formatBytes(totalBytes) + ')...'
+					);
+				}
+			}
+		}
+	}
+
+	async function pullUploads(remoteAjaxUrl) {
+		log('Uploads pull: getting inventories', 'info');
+		showProgress(5, 'Scanning uploads on both sites...');
+
+		const remoteInv = await getRemoteInventory(remoteAjaxUrl, 'uploads');
+		const localInv  = await getLocalInventory('uploads');
+		const toTransfer = diffInventories(remoteInv, localInv);
+
+		if (toTransfer.length === 0) {
+			log('Uploads pull: all files up to date', 'success');
+			showProgress(100, 'Uploads already in sync!');
+			return;
+		}
+
+		await transferUploadFiles(
+			toTransfer,
+			remoteInv,
+			function(relativePath, offset) {
+				return remoteRequest(remoteAjaxUrl, {
+					action: 'sync_export_upload_chunk',
+					key: remoteKey,
+					relative_path: relativePath,
+					offset: offset
+				}, remoteKey);
+			},
+			async function(relativePath, data, isLast) {
+				const req = {
+					action: 'sync_import_upload_chunk',
+					key: remoteKey,
+					relative_path: relativePath,
+					data: data,
+					is_last: isLast ? '1' : ''
+				};
+				const sig = await createSignature(req, connectionKey);
+				req.nonce = nonce;
+				req.sig   = sig;
+				return localPost(req);
+			}
+		);
+
+		log('Uploads pull complete', 'success');
+		showProgress(100, 'Uploads synced!');
+	}
+
+	async function pushUploads(remoteAjaxUrl) {
+		log('Uploads push: getting inventories', 'info');
+		showProgress(5, 'Scanning uploads on both sites...');
+
+		const localInv  = await getLocalInventory('uploads');
+		const remoteInv = await getRemoteInventory(remoteAjaxUrl, 'uploads');
+		const toTransfer = diffInventories(localInv, remoteInv);
+
+		if (toTransfer.length === 0) {
+			log('Uploads push: all files up to date', 'success');
+			showProgress(100, 'Uploads already in sync!');
+			return;
+		}
+
+		await transferUploadFiles(
+			toTransfer,
+			localInv,
+			async function(relativePath, offset) {
+				const req = {
+					action: 'sync_export_upload_chunk',
+					key: remoteKey,
+					relative_path: relativePath,
+					offset: offset
+				};
+				const sig = await createSignature(req, connectionKey);
+				req.nonce = nonce;
+				req.sig   = sig;
+				return localPost(req);
+			},
+			function(relativePath, data, isLast) {
+				return remoteRequest(remoteAjaxUrl, {
+					action: 'sync_import_upload_chunk',
+					key: remoteKey,
+					relative_path: relativePath,
+					data: data,
+					is_last: isLast ? '1' : ''
+				}, remoteKey);
+			}
+		);
+
+		log('Uploads push complete', 'success');
+		showProgress(100, 'Uploads synced!');
 	}
 
 	// ── HMAC signing ──────────────────────────────────────────────────────────
