@@ -11,7 +11,10 @@ if ( ! defined( 'ABSPATH' ) ) {
 
 $admin = SYNC_Admin::get_instance();
 $settings = get_option( 'sync_settings', array() );
-$connection_key = isset( $settings['key'] ) ? $settings['key'] : '';
+$connection_key  = isset( $settings['key'] ) ? $settings['key'] : '';
+$basic_auth_user = isset( $settings['basic_auth_user'] ) ? $settings['basic_auth_user'] : '';
+$skip_ssl        = ! empty( $settings['skip_ssl'] );
+$concurrency     = isset( $settings['concurrency'] ) ? (int) $settings['concurrency'] : 3;
 ?>
 
 <div class="wrap sync-wrap">
@@ -64,6 +67,52 @@ $connection_key = isset( $settings['key'] ) ? $settings['key'] : '';
 					<span id="connection-status" class="connection-status"></span>
 				</div>
 			</div>
+
+			<!-- Advanced Settings -->
+			<details class="sync-advanced" id="sync-advanced-settings">
+				<summary><?php echo esc_html__( 'Advanced Settings', 'what-are-you-syncing-about' ); ?></summary>
+				<div class="sync-advanced-body">
+					<?php if ( $skip_ssl ) : ?>
+					<div class="notice notice-warning inline" style="margin: 8px 0;">
+						<p><?php echo esc_html__( 'SSL verification is disabled. Only use this for trusted staging environments.', 'what-are-you-syncing-about' ); ?></p>
+					</div>
+					<?php endif; ?>
+					<div class="form-row">
+						<label for="basic-auth-user">
+							<?php echo esc_html__( 'HTTP Basic Auth Username', 'what-are-you-syncing-about' ); ?>
+						</label>
+						<input type="text" id="basic-auth-user" class="regular-text" value="<?php echo esc_attr( $basic_auth_user ); ?>" autocomplete="off" />
+						<p class="description"><?php echo esc_html__( 'Username if the remote site is behind HTTP Basic Auth (common on staging).', 'what-are-you-syncing-about' ); ?></p>
+					</div>
+					<div class="form-row">
+						<label for="basic-auth-pass">
+							<?php echo esc_html__( 'HTTP Basic Auth Password', 'what-are-you-syncing-about' ); ?>
+						</label>
+						<input type="password" id="basic-auth-pass" class="regular-text" value="" autocomplete="current-password" />
+						<p class="description"><?php echo esc_html__( 'Password for HTTP Basic Auth. Leave blank to keep existing saved password.', 'what-are-you-syncing-about' ); ?></p>
+					</div>
+					<div class="form-row">
+						<label>
+							<input type="checkbox" id="skip-ssl" <?php checked( $skip_ssl ); ?> />
+							<?php echo esc_html__( 'Skip SSL certificate verification', 'what-are-you-syncing-about' ); ?>
+						</label>
+						<p class="description"><?php echo esc_html__( 'Use for staging sites with self-signed certificates. Do not enable on production.', 'what-are-you-syncing-about' ); ?></p>
+					</div>
+					<div class="form-row">
+						<label for="concurrency">
+							<?php echo esc_html__( 'Parallel Tables', 'what-are-you-syncing-about' ); ?>
+						</label>
+						<input type="number" id="concurrency" class="small-text" value="<?php echo esc_attr( $concurrency ); ?>" min="1" max="10" />
+						<p class="description"><?php echo esc_html__( 'Tables processed simultaneously (1–10). Reduce to 1 on shared hosts with strict PHP process limits.', 'what-are-you-syncing-about' ); ?></p>
+					</div>
+					<div class="form-row">
+						<button type="button" id="save-advanced-settings-btn" class="button button-secondary">
+							<?php echo esc_html__( 'Save Settings', 'what-are-you-syncing-about' ); ?>
+						</button>
+						<span id="settings-save-status" class="connection-status"></span>
+					</div>
+				</div>
+			</details>
 		</div>
 
 		<!-- Migration Actions Section -->
@@ -104,6 +153,13 @@ $connection_key = isset( $settings['key'] ) ? $settings['key'] : '';
 					</button>
 				</div>
 				<pre id="sync-log-output" class="sync-log-output" aria-live="polite"></pre>
+			</div>
+		</div>
+
+		<!-- Warning Section -->
+		<div class="sync-section" id="warning-section" style="display: none;">
+			<div class="notice notice-warning">
+				<p id="warning-message" style="margin: 0;"></p>
 			</div>
 		</div>
 

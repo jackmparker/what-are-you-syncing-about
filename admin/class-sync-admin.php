@@ -88,10 +88,11 @@ class SYNC_Admin {
 		$site_info = $core->get_site_info();
 
 		wp_localize_script( 'sync-admin', 'syncSimple', array(
-			'ajaxUrl' => admin_url( 'admin-ajax.php' ),
-			'nonce' => wp_create_nonce( 'sync_nonce' ),
+			'ajaxUrl'     => admin_url( 'admin-ajax.php' ),
+			'nonce'       => wp_create_nonce( 'sync_nonce' ),
 			'connectionKey' => $this->settings['key'],
-			'siteInfo' => $site_info,
+			'concurrency' => isset( $this->settings['concurrency'] ) ? (int) $this->settings['concurrency'] : 3,
+			'siteInfo'    => $site_info,
 			'i18n' => array(
 				'verifyConnection' => __( 'Verify Connection', 'what-are-you-syncing-about' ),
 				'connectionVerified' => __( 'Connection verified successfully!', 'what-are-you-syncing-about' ),

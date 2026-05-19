@@ -12,6 +12,13 @@
 	const siteInfo = wpsdb.siteInfo || {};
 	const i18n = wpsdb.i18n || {};
 
+	// How many tables to process simultaneously (saved in Advanced Settings)
+	const CONCURRENCY = Math.max( 1, Math.min( 10, parseInt( wpsdb.concurrency || '3', 10 ) ) );
+	// Tables with fewer than this many bytes are batched together
+	const SMALL_TABLE_THRESHOLD = 4096;
+	// Max tables per batch request
+	const SMALL_TABLE_BATCH_SIZE = 20;
+
 	let remoteUrl = '';
 	let remoteKey = '';
 	let connectionVerified = false;
@@ -29,16 +36,23 @@
 	const progressSection = document.getElementById('progress-section');
 	const progressBarFill = document.getElementById('progress-bar-fill');
 	const progressText = document.getElementById('progress-text');
+	const warningSection = document.getElementById('warning-section');
+	const warningMessage = document.getElementById('warning-message');
 	const errorSection = document.getElementById('error-section');
 	const errorMessage = document.getElementById('error-message');
 	const successSection = document.getElementById('success-section');
 	const successMessage = document.getElementById('success-message');
 	const logOutput = document.getElementById('sync-log-output');
 	const clearLogBtn = document.getElementById('clear-log-btn');
+	const saveAdvancedBtn = document.getElementById('save-advanced-settings-btn');
+	const settingsSaveStatus = document.getElementById('settings-save-status');
+	const basicAuthUserInput = document.getElementById('basic-auth-user');
+	const basicAuthPassInput = document.getElementById('basic-auth-pass');
+	const skipSslInput = document.getElementById('skip-ssl');
+	const concurrencyInput = document.getElementById('concurrency');
 
-	/**
-	 * Append a timestamped line to the activity log
-	 */
+	// ── Logging ──────────────────────────────────────────────────────────────
+
 	function log(message, level) {
 		level = level || 'info';
 		if (!logOutput) {
@@ -76,7 +90,7 @@
 			const lower = key.toLowerCase();
 			if (lower === 'key' || lower === 'sig' || lower === 'nonce') {
 				out[key] = '[redacted]';
-			} else if ((lower === 'sql' || lower === 'sql_b64') && typeof data[key] === 'string') {
+			} else if ((lower === 'sql' || lower === 'sql_b64' || lower === 'sql_gz_b64') && typeof data[key] === 'string') {
 				out[key] = '[' + key + ' ' + data[key].length + ' chars]';
 			} else {
 				out[key] = sanitizeForLog(data[key]);
@@ -99,12 +113,167 @@
 	log('Local site: ' + (siteInfo.url || 'unknown') + ' | tables: ' + ((siteInfo.tables || []).length), 'info');
 	log('Connection key present: ' + (connectionKey ? 'yes' : 'no'), 'info');
 
-	// Copy key to clipboard
+	// ── UI helpers ────────────────────────────────────────────────────────────
+
+	function showProgress(percent, text) {
+		if (progressSection) progressSection.style.display = 'block';
+		if (progressBarFill) {
+			progressBarFill.style.width = percent + '%';
+			progressBarFill.textContent = Math.round(percent) + '%';
+		}
+		if (progressText) progressText.textContent = text || '';
+	}
+
+	function showWarning(message) {
+		if (!message || message.trim() === '') { hideWarning(); return; }
+		if (warningSection) warningSection.style.display = 'block';
+		if (warningMessage) warningMessage.textContent = message;
+	}
+
+	function hideWarning() {
+		if (warningSection) warningSection.style.display = 'none';
+	}
+
+	function showError(message) {
+		if (!message || message.trim() === '') { hideError(); return; }
+		// Append helpful hints for common failure patterns
+		let hint = '';
+		if (/failed to fetch|networkerror|network error/i.test(message)) {
+			hint = ' — check that the remote site is reachable and CORS is allowed';
+		} else if (/waf.blocked|access denied/i.test(message)) {
+			hint = ' — add the remote site\'s admin-ajax.php to your WAF allowlist';
+		} else if (/ssl|certificate/i.test(message)) {
+			hint = ' — try enabling "Skip SSL certificate verification" in Advanced Settings';
+		} else if (/401|unauthorized/i.test(message)) {
+			hint = ' — the remote site may require HTTP Basic Auth credentials (see Advanced Settings)';
+		}
+		if (errorSection) errorSection.style.display = 'block';
+		if (errorMessage) errorMessage.textContent = message + hint;
+	}
+
+	function hideError() {
+		if (errorSection) errorSection.style.display = 'none';
+	}
+
+	function showSuccess(message) {
+		if (!message || message.trim() === '') { hideSuccess(); return; }
+		if (successSection) successSection.style.display = 'block';
+		if (successMessage) successMessage.textContent = message;
+	}
+
+	function hideSuccess() {
+		if (successSection) successSection.style.display = 'none';
+	}
+
+	// ── Async helpers ─────────────────────────────────────────────────────────
+
+	/**
+	 * Retry a function up to maxAttempts times on thrown errors (network / HTTP non-200).
+	 * Does NOT retry on 200-with-success:false (SQL already ran server-side).
+	 */
+	async function withRetry(fn, maxAttempts) {
+		maxAttempts = maxAttempts || 3;
+		let lastErr;
+		for (let i = 0; i < maxAttempts; i++) {
+			try {
+				return await fn();
+			} catch (e) {
+				lastErr = e;
+				if (i < maxAttempts - 1) {
+					const delay = 2000 * Math.pow(2, i); // 2s, 4s, 8s
+					log('Request failed (attempt ' + (i + 1) + '/' + maxAttempts + '), retrying in ' + (delay / 1000) + 's: ' + e.message, 'warn');
+					await new Promise(function(r) { setTimeout(r, delay); });
+				}
+			}
+		}
+		throw lastErr;
+	}
+
+	/**
+	 * Run tasks with at most `limit` executing at the same time.
+	 * Fails fast: rejects on first task rejection.
+	 */
+	async function runWithConcurrency(tasks, limit) {
+		const results = [];
+		const executing = new Set();
+		for (const task of tasks) {
+			const p = task().then(function(r) { executing.delete(p); return r; });
+			executing.add(p);
+			results.push(p);
+			if (executing.size >= limit) {
+				await Promise.race(executing);
+			}
+		}
+		return Promise.all(results);
+	}
+
+	/**
+	 * Split tables into small batches and large individual tables.
+	 * Small = byte size < SMALL_TABLE_THRESHOLD (from information_schema).
+	 */
+	function groupTables(tables, tableSizes) {
+		const small = [];
+		const large = [];
+		for (const t of tables) {
+			const size = tableSizes[t];
+			if (typeof size === 'number' && size < SMALL_TABLE_THRESHOLD) {
+				small.push(t);
+			} else {
+				large.push(t);
+			}
+		}
+		const batches = [];
+		for (let i = 0; i < small.length; i += SMALL_TABLE_BATCH_SIZE) {
+			batches.push(small.slice(i, i + SMALL_TABLE_BATCH_SIZE));
+		}
+		return { batches: batches, largeTables: large };
+	}
+
+	/**
+	 * POST to local AJAX endpoint; throws on network error or HTTP non-200.
+	 */
+	async function localPost(data) {
+		const response = await fetch(ajaxUrl, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams(data),
+			signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout
+				? AbortSignal.timeout(600000)
+				: undefined
+		});
+		if (!response.ok) {
+			const text = await response.text().catch(function() { return ''; });
+			throw new Error('HTTP ' + response.status + ': ' + text.substring(0, 200));
+		}
+		return response.json();
+	}
+
+	/**
+	 * Build and sign an import request body for sync_import_chunk.
+	 */
+	async function buildImportRequest(sqlField, sqlValue, remoteInfo) {
+		const req = {
+			action: 'sync_import_chunk',
+			key: remoteKey,
+			old_url: remoteInfo.url,
+			new_url: siteInfo.url,
+			old_path: remoteInfo.path,
+			new_path: siteInfo.path,
+			source_prefix: remoteInfo.prefix
+		};
+		req[sqlField] = sqlValue;
+		const sig = await createSignature(req, connectionKey);
+		req.nonce = nonce;
+		req.sig = sig;
+		return req;
+	}
+
+	// ── Event bindings ────────────────────────────────────────────────────────
+
 	if (copyKeyBtn && connectionKeyInput) {
 		copyKeyBtn.addEventListener('click', function() {
 			connectionKeyInput.select();
-			connectionKeyInput.setSelectionRange(0, 99999); // For mobile devices
-
+			connectionKeyInput.setSelectionRange(0, 99999);
 			try {
 				document.execCommand('copy');
 				copyKeyBtn.textContent = i18n.keyCopied || 'Key copied!';
@@ -117,28 +286,59 @@
 		});
 	}
 
-	// Verify connection
 	if (verifyConnectionBtn) {
 		verifyConnectionBtn.addEventListener('click', verifyConnection);
 	}
 
-	// Pull database
 	if (pullDatabaseBtn) {
-		pullDatabaseBtn.addEventListener('click', function() {
-			startMigration('pull');
-		});
+		pullDatabaseBtn.addEventListener('click', function() { startMigration('pull'); });
 	}
 
-	// Push database
 	if (pushDatabaseBtn) {
-		pushDatabaseBtn.addEventListener('click', function() {
-			startMigration('push');
-		});
+		pushDatabaseBtn.addEventListener('click', function() { startMigration('push'); });
 	}
 
-	/**
-	 * Verify connection to remote site
-	 */
+	if (saveAdvancedBtn) {
+		saveAdvancedBtn.addEventListener('click', saveAdvancedSettings);
+	}
+
+	// ── Save advanced settings ────────────────────────────────────────────────
+
+	async function saveAdvancedSettings() {
+		saveAdvancedBtn.disabled = true;
+		if (settingsSaveStatus) { settingsSaveStatus.textContent = ''; settingsSaveStatus.className = 'connection-status'; }
+
+		try {
+			const data = {
+				action: 'sync_save_settings',
+				basic_auth_user: basicAuthUserInput ? basicAuthUserInput.value : '',
+				basic_auth_pass: basicAuthPassInput ? basicAuthPassInput.value : '',
+				skip_ssl: skipSslInput && skipSslInput.checked ? '1' : '',
+				concurrency: concurrencyInput ? concurrencyInput.value : '3'
+			};
+			const sig = await createSignature(data, connectionKey);
+			data.nonce = nonce;
+			data.sig = sig;
+
+			const result = await localPost(data);
+			if (result.success) {
+				if (settingsSaveStatus) { settingsSaveStatus.textContent = 'Saved!'; settingsSaveStatus.className = 'connection-status success'; }
+				log('Advanced settings saved', 'success');
+				// Clear the password field after saving
+				if (basicAuthPassInput) basicAuthPassInput.value = '';
+			} else {
+				if (settingsSaveStatus) { settingsSaveStatus.textContent = result.error || 'Save failed'; settingsSaveStatus.className = 'connection-status error'; }
+			}
+		} catch (err) {
+			if (settingsSaveStatus) { settingsSaveStatus.textContent = 'Save failed: ' + err.message; settingsSaveStatus.className = 'connection-status error'; }
+			log('Settings save failed: ' + err.message, 'error');
+		} finally {
+			saveAdvancedBtn.disabled = false;
+		}
+	}
+
+	// ── Connection verification ───────────────────────────────────────────────
+
 	async function verifyConnection() {
 		remoteUrl = remoteUrlInput.value.trim();
 		remoteKey = remoteKeyInput.value.trim();
@@ -149,7 +349,6 @@
 			return;
 		}
 
-		// Normalize URL
 		remoteUrl = remoteUrl.replace(/\/$/, '');
 		log('Verifying connection to ' + remoteUrl, 'info');
 
@@ -164,17 +363,13 @@
 				url: remoteUrl,
 				key: remoteKey
 			};
-
-			// Create signature using the local key (server expects local key for wp_ajax)
 			const sig = await createSignature(data, connectionKey);
 			data.nonce = nonce;
 			data.sig = sig;
 
 			const response = await fetch(ajaxUrl, {
 				method: 'POST',
-				headers: {
-					'Content-Type': 'application/x-www-form-urlencoded',
-				},
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
 				body: new URLSearchParams(data)
 			});
 
@@ -191,7 +386,7 @@
 				pushDatabaseBtn.disabled = false;
 			} else {
 				connectionVerified = false;
-				log('Connection failed: ' + (result.error || result.data?.message || 'unknown'), 'error');
+				log('Connection failed: ' + (result.error || 'unknown'), 'error');
 				connectionStatus.textContent = result.error || (i18n.connectionFailed || 'Connection failed');
 				connectionStatus.className = 'connection-status error';
 				pullDatabaseBtn.disabled = true;
@@ -204,23 +399,20 @@
 			connectionStatus.className = 'connection-status error';
 			pullDatabaseBtn.disabled = true;
 			pushDatabaseBtn.disabled = true;
-			console.error('Connection error:', error);
 		} finally {
 			verifyConnectionBtn.disabled = false;
 			verifyConnectionBtn.textContent = i18n.verifyConnection || 'Verify Connection';
 		}
 	}
 
-	/**
-	 * Start migration (pull or push)
-	 */
+	// ── Migration orchestration ───────────────────────────────────────────────
+
 	async function startMigration(type) {
 		if (!connectionVerified) {
 			log('Migration blocked: connection not verified', 'warn');
 			showError('Please verify connection first');
 			return;
 		}
-
 		if (migrationInProgress) {
 			log('Migration already in progress', 'warn');
 			return;
@@ -229,10 +421,10 @@
 		log('Starting ' + type + ' migration → ' + remoteUrl, 'info');
 		migrationInProgress = true;
 		hideError();
+		hideWarning();
 		hideSuccess();
 		showProgress(0, i18n.migrationInProgress || 'Migration in progress...');
 
-		// Disable buttons
 		pullDatabaseBtn.disabled = true;
 		pushDatabaseBtn.disabled = true;
 		verifyConnectionBtn.disabled = true;
@@ -248,7 +440,7 @@
 			showError(error.message || 'Migration failed');
 			console.error('Migration error:', error);
 		} finally {
-			log('Migration finished (inProgress=false)', 'info');
+			log('Migration finished', 'info');
 			migrationInProgress = false;
 			pullDatabaseBtn.disabled = false;
 			pushDatabaseBtn.disabled = false;
@@ -256,15 +448,14 @@
 		}
 	}
 
-	/**
-	 * Pull database from remote
-	 */
+	// ── Pull migration ────────────────────────────────────────────────────────
+
 	async function pullDatabase() {
 		const remoteAjaxUrl = remoteUrl + '/wp-admin/admin-ajax.php';
 		log('Pull: remote AJAX URL ' + remoteAjaxUrl, 'info');
 
 		// Step 1: Get remote site info
-		showProgress(10, i18n.creatingBackup || 'Getting remote site info...');
+		showProgress(5, 'Getting remote site info...');
 		log('Pull step 1: sync_get_connection_info (remote)', 'info');
 		const remoteInfo = await remoteRequest(remoteAjaxUrl, {
 			action: 'sync_get_connection_info',
@@ -275,134 +466,138 @@
 			logObject('Pull step 1 failed', remoteInfo, 'error');
 			throw new Error(remoteInfo.error || 'Failed to get remote site info');
 		}
-		log('Pull step 1 OK — remote tables: ' + (remoteInfo.data.tables || []).length, 'success');
-		logObject('Remote site info', remoteInfo.data, 'info');
+		log('Pull step 1 OK — remote tables: ' + (remoteInfo.data.tables || []).length + ' | plugin: ' + (remoteInfo.data.plugin_version || 'unknown'), 'success');
+
+		// Charset warning
+		if (siteInfo.db_charset && remoteInfo.data.db_charset && siteInfo.db_charset !== remoteInfo.data.db_charset) {
+			const msg = 'Charset mismatch: local=' + siteInfo.db_charset + ', remote=' + remoteInfo.data.db_charset + '. Serialized data may not convert correctly.';
+			log(msg, 'warn');
+			showWarning(msg);
+		}
 
 		// Step 2: Initiate migration (creates local backup)
-		showProgress(20, i18n.creatingBackup || 'Creating backup...');
+		showProgress(15, i18n.creatingBackup || 'Creating backup...');
 		log('Pull step 2: sync_initiate_migration (local backup)', 'info');
-		const initiateData_req = {
+		const initiateReq = {
 			action: 'sync_initiate_migration',
 			action_type: 'pull',
 			key: remoteKey
 		};
-		const initiateSig = await createSignature(initiateData_req, connectionKey);
-		initiateData_req.nonce = nonce;
-		initiateData_req.sig = initiateSig;
+		const initiateSig = await createSignature(initiateReq, connectionKey);
+		initiateReq.nonce = nonce;
+		initiateReq.sig = initiateSig;
 
-		const initiateResult = await fetch(ajaxUrl, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/x-www-form-urlencoded',
-			},
-			body: new URLSearchParams(initiateData_req)
-		});
-		const initiateData = await initiateResult.json();
+		const initiateData = await withRetry(function() { return localPost(initiateReq); }, 1);
 		logObject('Pull step 2 response', initiateData, initiateData.success ? 'success' : 'error');
-
 		if (!initiateData.success) {
 			throw new Error(initiateData.error || 'Failed to initiate migration');
 		}
 
-		// Step 3: Export and import tables
+		// Step 3: Export and import tables (parallel + batched)
 		const tables = remoteInfo.data.tables || [];
-		const totalTables = tables.length;
-		let completedTables = 0;
-		log('Pull step 3: syncing ' + totalTables + ' tables', 'info');
+		const tableSizes = remoteInfo.data.table_sizes || {};
+		const { batches, largeTables } = groupTables(tables, tableSizes);
 
-		for (const table of tables) {
-			log('Pull table ' + (completedTables + 1) + '/' + totalTables + ': ' + table, 'info');
-			let offset = 0;
-			let hasMore = true;
+		log('Pull step 3: ' + tables.length + ' tables → ' + batches.length + ' small batches + ' + largeTables.length + ' large tables (concurrency=' + CONCURRENCY + ')', 'info');
 
-			while (hasMore) {
-				showProgress(
-					30 + (completedTables / totalTables) * 50,
-					`${i18n.exportingTables || 'Exporting'} ${table}...`
-				);
+		let completedTasks = 0;
+		const totalTasks = batches.length + largeTables.length || 1;
 
-				// Export chunk from remote
-				const exportResult = await remoteRequest(remoteAjaxUrl, {
-					action: 'sync_export_chunk',
-					key: remoteKey,
-					table: table,
-					offset: offset
-				}, remoteKey);
+		function updateProgress() {
+			showProgress(20 + (completedTasks / totalTasks) * 65, 'Syncing tables (' + completedTasks + '/' + totalTasks + ')...');
+		}
+		updateProgress();
 
-				if (!exportResult.success) {
-					logObject('Export chunk failed (' + table + '@' + offset + ')', exportResult, 'error');
-					throw new Error(exportResult.error || 'Export failed');
+		const tasks = [];
+
+		// Small table batch tasks
+		for (const batch of batches) {
+			tasks.push(async function() {
+				try {
+					log('Pull batch: ' + batch.join(', '), 'info');
+
+					const exportResult = await withRetry(function() {
+						return remoteRequest(remoteAjaxUrl, {
+							action: 'sync_export_batch',
+							key: remoteKey,
+							tables: JSON.stringify(batch)
+						}, remoteKey);
+					});
+
+					if (!exportResult.success) {
+						throw new Error(exportResult.error || 'Batch export failed');
+					}
+
+					const sqlField = exportResult.sql_gz_b64 ? 'sql_gz_b64' : 'sql';
+					const importReq = await buildImportRequest(sqlField, exportResult[sqlField], remoteInfo.data);
+					const importData = await withRetry(function() { return localPost(importReq); });
+					if (!importData.success) {
+						throw new Error(importData.error || 'Batch import failed');
+					}
+
+					log('Pull batch OK: ' + batch.length + ' tables', 'success');
+					completedTasks++;
+					updateProgress();
+				} catch (err) {
+					throw new Error('Batch [' + batch.join(',') + ']: ' + err.message);
 				}
-				log('Exported ' + table + ' offset ' + offset + ' — rows: ' + exportResult.rows_exported + '/' + exportResult.total_rows + ', has_more: ' + exportResult.has_more, 'info');
-
-				// Import chunk locally
-				showProgress(
-					30 + (completedTables / totalTables) * 50,
-					`${i18n.importingTables || 'Importing'} ${table}... (${offset} / ${exportResult.total_rows})`
-				);
-
-				// Create request data
-				const importData_req = {
-					action: 'sync_import_chunk',
-					key: remoteKey,
-					sql: exportResult.sql,
-					old_url: remoteInfo.data.url,
-					new_url: siteInfo.url,
-					old_path: remoteInfo.data.path,
-					new_path: siteInfo.path,
-					source_prefix: remoteInfo.data.prefix
-				};
-
-				// Create signature from the data that will be sent
-				const sig = await createSignature(importData_req, connectionKey);
-
-				// Add nonce and signature
-				importData_req.nonce = nonce;
-				importData_req.sig = sig;
-
-				const importResult = await fetch(ajaxUrl, {
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/x-www-form-urlencoded',
-					},
-					body: new URLSearchParams(importData_req)
-				});
-				const importData = await importResult.json();
-
-				if (!importData.success) {
-					logObject('Import chunk failed (' + table + '@' + offset + ')', importData, 'error');
-					throw new Error(importData.error || 'Import failed');
-				}
-				log('Imported ' + table + ' offset ' + offset, 'success');
-
-				hasMore = exportResult.has_more;
-				offset += exportResult.rows_exported || 1000;
-			}
-
-			completedTables++;
+			});
 		}
 
-		// Step 4: Finalize migration
+		// Large table tasks
+		for (const table of largeTables) {
+			tasks.push(async function() {
+				try {
+					let offset = 0;
+					let hasMore = true;
+
+					while (hasMore) {
+						const exportResult = await withRetry(function() {
+							return remoteRequest(remoteAjaxUrl, {
+								action: 'sync_export_chunk',
+								key: remoteKey,
+								table: table,
+								offset: offset
+							}, remoteKey);
+						});
+
+						if (!exportResult.success) {
+							throw new Error(exportResult.error || 'Export failed');
+						}
+						log('Pull ' + table + ' offset ' + offset + ' — rows ' + exportResult.rows_exported + '/' + exportResult.total_rows, 'info');
+
+						const sqlField = exportResult.sql_gz_b64 ? 'sql_gz_b64' : 'sql';
+						const importReq = await buildImportRequest(sqlField, exportResult[sqlField], remoteInfo.data);
+						const importData = await withRetry(function() { return localPost(importReq); });
+						if (!importData.success) {
+							throw new Error(importData.error || 'Import failed');
+						}
+
+						hasMore = exportResult.has_more;
+						offset += exportResult.rows_exported || 1000;
+					}
+
+					log('Pull ' + table + ' complete', 'success');
+					completedTasks++;
+					updateProgress();
+				} catch (err) {
+					throw new Error('Table ' + table + ': ' + err.message);
+				}
+			});
+		}
+
+		await runWithConcurrency(tasks, CONCURRENCY);
+
+		// Step 4: Finalize
 		showProgress(90, i18n.finalizing || 'Finalizing migration...');
 		log('Pull step 4: sync_finalize_migration (local)', 'info');
-		const finalizeData_req = {
-			action: 'sync_finalize_migration',
-			key: remoteKey
-		};
-		const finalizeSig = await createSignature(finalizeData_req, connectionKey);
-		finalizeData_req.nonce = nonce;
-		finalizeData_req.sig = finalizeSig;
+		const finalizeReq = { action: 'sync_finalize_migration', key: remoteKey };
+		const finalizeSig = await createSignature(finalizeReq, connectionKey);
+		finalizeReq.nonce = nonce;
+		finalizeReq.sig = finalizeSig;
 
-		const finalizeResult = await fetch(ajaxUrl, {
-			method: 'POST',
-			headers: {
-				'Content-Type': 'application/x-www-form-urlencoded',
-			},
-			body: new URLSearchParams(finalizeData_req)
-		});
-		const finalizeData = await finalizeResult.json();
+		const finalizeData = await localPost(finalizeReq);
 		logObject('Pull step 4 response', finalizeData, finalizeData.success ? 'success' : 'error');
-
 		if (!finalizeData.success) {
 			throw new Error(finalizeData.error || 'Finalization failed');
 		}
@@ -412,15 +607,14 @@
 		showSuccess(i18n.migrationComplete || 'Migration completed successfully!');
 	}
 
-	/**
-	 * Push database to remote
-	 */
+	// ── Push migration ────────────────────────────────────────────────────────
+
 	async function pushDatabase() {
 		const remoteAjaxUrl = remoteUrl + '/wp-admin/admin-ajax.php';
 		log('Push: remote AJAX URL ' + remoteAjaxUrl, 'info');
 
 		// Step 1: Get remote site info
-		showProgress(10, 'Getting remote site info...');
+		showProgress(5, 'Getting remote site info...');
 		log('Push step 1: sync_get_connection_info (remote)', 'info');
 		const remoteInfo = await remoteRequest(remoteAjaxUrl, {
 			action: 'sync_get_connection_info',
@@ -431,10 +625,17 @@
 			logObject('Push step 1 failed', remoteInfo, 'error');
 			throw new Error(remoteInfo.error || 'Failed to get remote site info');
 		}
-		log('Push step 1 OK — remote: ' + remoteInfo.data.url, 'success');
+		log('Push step 1 OK — remote: ' + remoteInfo.data.url + ' | plugin: ' + (remoteInfo.data.plugin_version || 'unknown'), 'success');
+
+		// Charset warning
+		if (siteInfo.db_charset && remoteInfo.data.db_charset && siteInfo.db_charset !== remoteInfo.data.db_charset) {
+			const msg = 'Charset mismatch: local=' + siteInfo.db_charset + ', remote=' + remoteInfo.data.db_charset + '. Serialized data may not convert correctly.';
+			log(msg, 'warn');
+			showWarning(msg);
+		}
 
 		// Step 2: Initiate migration on remote (creates remote backup)
-		showProgress(20, 'Initiating migration on remote site...');
+		showProgress(15, 'Initiating migration on remote site...');
 		log('Push step 2: sync_initiate_migration (remote backup)', 'info');
 		const initiateResult = await remoteRequest(remoteAjaxUrl, {
 			action: 'sync_initiate_migration',
@@ -448,85 +649,135 @@
 		}
 		log('Push step 2 OK', 'success');
 
-		// Step 3: Export and send tables
+		// Step 3: Export and send tables (parallel + batched)
 		const tables = siteInfo.tables || [];
-		const totalTables = tables.length;
-		let completedTables = 0;
-		log('Push step 3: syncing ' + totalTables + ' local tables', 'info');
+		const tableSizes = siteInfo.table_sizes || {};
+		const { batches, largeTables } = groupTables(tables, tableSizes);
 
-		for (const table of tables) {
-			log('Push table ' + (completedTables + 1) + '/' + totalTables + ': ' + table, 'info');
-			let offset = 0;
-			let hasMore = true;
+		log('Push step 3: ' + tables.length + ' tables → ' + batches.length + ' small batches + ' + largeTables.length + ' large tables (concurrency=' + CONCURRENCY + ')', 'info');
 
-			while (hasMore) {
-				showProgress(
-					30 + (completedTables / totalTables) * 50,
-					`Exporting ${table}...`
-				);
+		let completedTasks = 0;
+		const totalTasks = batches.length + largeTables.length || 1;
 
-				// Export chunk locally
-				const exportData_req = {
-					action: 'sync_export_chunk',
-					key: remoteKey,
-					table: table,
-					offset: offset
-				};
-				const exportSig = await createSignature(exportData_req, connectionKey);
-				exportData_req.nonce = nonce;
-				exportData_req.sig = exportSig;
+		function updateProgress() {
+			showProgress(20 + (completedTasks / totalTasks) * 65, 'Sending tables (' + completedTasks + '/' + totalTasks + ')...');
+		}
+		updateProgress();
 
-				const exportResult = await fetch(ajaxUrl, {
-					method: 'POST',
-					headers: {
-						'Content-Type': 'application/x-www-form-urlencoded',
-					},
-					body: new URLSearchParams(exportData_req)
-				});
-				const exportData = await exportResult.json();
+		const tasks = [];
 
-				if (!exportData.success) {
-					logObject('Push export failed (' + table + '@' + offset + ')', exportData, 'error');
-					throw new Error(exportData.error || 'Export failed');
+		// Small table batch tasks
+		for (const batch of batches) {
+			tasks.push(async function() {
+				try {
+					log('Push batch: ' + batch.join(', '), 'info');
+
+					// Export batch locally
+					const exportReq = {
+						action: 'sync_export_batch',
+						key: remoteKey,
+						tables: JSON.stringify(batch)
+					};
+					const exportSig = await createSignature(exportReq, connectionKey);
+					exportReq.nonce = nonce;
+					exportReq.sig = exportSig;
+
+					const exportData = await withRetry(function() { return localPost(exportReq); });
+					if (!exportData.success) {
+						throw new Error(exportData.error || 'Batch export failed');
+					}
+
+					// Send to remote via proxy
+					const sqlField = exportData.sql_gz_b64 ? 'sql_gz_b64' : 'sql';
+					const importResult = await withRetry(function() {
+						return proxyRemoteImport({
+							remote_url: remoteUrl,
+							key: remoteKey,
+							[sqlField]: exportData[sqlField],
+							old_url: siteInfo.url,
+							new_url: remoteInfo.data.url,
+							old_path: siteInfo.path,
+							new_path: remoteInfo.data.path,
+							source_prefix: siteInfo.prefix
+						});
+					});
+
+					if (!importResult.success) {
+						throw new Error(importResult.error || 'Batch import failed');
+					}
+
+					log('Push batch OK: ' + batch.length + ' tables', 'success');
+					completedTasks++;
+					updateProgress();
+				} catch (err) {
+					throw new Error('Batch [' + batch.join(',') + ']: ' + err.message);
 				}
-				const sqlKb = exportData.sql_bytes ? Math.round(exportData.sql_bytes / 1024) : Math.round((exportData.sql || '').length / 1024);
-				log('Push exported ' + table + ' offset ' + offset + ' — rows: ' + exportData.rows_exported + '/' + exportData.total_rows + ', ~' + sqlKb + 'KB', 'info');
-
-				// Import chunk on remote
-				showProgress(
-					30 + (completedTables / totalTables) * 50,
-					`Sending ${table} to remote... (${offset + exportData.rows_exported} / ${exportData.total_rows}, ~${sqlKb}KB)`
-				);
-
-				if (sqlKb > 400) {
-					log('Large chunk upload in progress for ' + table + ' — this may take a minute', 'warn');
-				}
-
-				const importResult = await proxyRemoteImport({
-					remote_url: remoteUrl,
-					key: remoteKey,
-					sql: exportData.sql,
-					old_url: siteInfo.url,
-					new_url: remoteInfo.data.url,
-					old_path: siteInfo.path,
-					new_path: remoteInfo.data.path,
-					source_prefix: siteInfo.prefix
-				});
-
-				if (!importResult.success) {
-					logObject('Push remote import failed (' + table + '@' + offset + ')', importResult, 'error');
-					throw new Error(importResult.error || 'Import failed');
-				}
-				log('Push sent ' + table + ' offset ' + offset + ' to remote', 'success');
-
-				hasMore = exportData.has_more;
-				offset += exportData.rows_exported || 1000;
-			}
-
-			completedTables++;
+			});
 		}
 
-		// Step 4: Finalize migration on remote
+		// Large table tasks
+		for (const table of largeTables) {
+			tasks.push(async function() {
+				try {
+					let offset = 0;
+					let hasMore = true;
+
+					while (hasMore) {
+						const exportReq = {
+							action: 'sync_export_chunk',
+							key: remoteKey,
+							table: table,
+							offset: offset
+						};
+						const exportSig = await createSignature(exportReq, connectionKey);
+						exportReq.nonce = nonce;
+						exportReq.sig = exportSig;
+
+						const exportData = await withRetry(function() { return localPost(exportReq); });
+						if (!exportData.success) {
+							throw new Error(exportData.error || 'Export failed');
+						}
+						const sqlKb = exportData.sql_bytes ? Math.round(exportData.sql_bytes / 1024) : 0;
+						log('Push ' + table + ' offset ' + offset + ' — rows ' + exportData.rows_exported + '/' + exportData.total_rows + ', ~' + sqlKb + 'KB', 'info');
+
+						if (sqlKb > 400) {
+							log('Large chunk upload in progress for ' + table, 'warn');
+						}
+
+						const sqlField = exportData.sql_gz_b64 ? 'sql_gz_b64' : 'sql';
+						const importResult = await withRetry(function() {
+							return proxyRemoteImport({
+								remote_url: remoteUrl,
+								key: remoteKey,
+								[sqlField]: exportData[sqlField],
+								old_url: siteInfo.url,
+								new_url: remoteInfo.data.url,
+								old_path: siteInfo.path,
+								new_path: remoteInfo.data.path,
+								source_prefix: siteInfo.prefix
+							});
+						});
+
+						if (!importResult.success) {
+							throw new Error(importResult.error || 'Import failed');
+						}
+
+						hasMore = exportData.has_more;
+						offset += exportData.rows_exported || 1000;
+					}
+
+					log('Push ' + table + ' complete', 'success');
+					completedTasks++;
+					updateProgress();
+				} catch (err) {
+					throw new Error('Table ' + table + ': ' + err.message);
+				}
+			});
+		}
+
+		await runWithConcurrency(tasks, CONCURRENCY);
+
+		// Step 4: Finalize on remote
 		showProgress(90, 'Finalizing migration on remote site...');
 		log('Push step 4: sync_finalize_migration (remote)', 'info');
 		const finalizeResult = await remoteRequest(remoteAjaxUrl, {
@@ -544,18 +795,19 @@
 		showSuccess(i18n.migrationComplete || 'Migration completed successfully!');
 	}
 
+	// ── Network helpers ───────────────────────────────────────────────────────
+
 	/**
-	 * Push import via local PHP proxy (server-to-server, base64 SQL).
+	 * Push import via local PHP proxy (server-to-server).
+	 * Accepts either sql or sql_gz_b64 in payload.
 	 */
 	async function proxyRemoteImport(payload) {
 		log('Proxy import via local server → ' + payload.remote_url, 'info');
-		logObject('Proxy import payload', payload, 'info');
 
 		const data = {
 			action: 'sync_remote_import_chunk',
 			remote_url: payload.remote_url,
 			key: payload.key,
-			sql: payload.sql,
 			old_url: payload.old_url,
 			new_url: payload.new_url,
 			old_path: payload.old_path,
@@ -563,34 +815,18 @@
 			source_prefix: payload.source_prefix
 		};
 
+		// Pass through whichever SQL field we have
+		if (payload.sql_gz_b64) {
+			data.sql_gz_b64 = payload.sql_gz_b64;
+		} else {
+			data.sql = payload.sql;
+		}
+
 		const sig = await createSignature(data, connectionKey);
 		data.nonce = nonce;
 		data.sig = sig;
 
-		let response;
-		try {
-			response = await fetch(ajaxUrl, {
-				method: 'POST',
-				headers: {
-					'Content-Type': 'application/x-www-form-urlencoded',
-				},
-				body: new URLSearchParams(data),
-				signal: typeof AbortSignal !== 'undefined' && AbortSignal.timeout
-					? AbortSignal.timeout(600000)
-					: undefined
-			});
-		} catch (error) {
-			log('Proxy import fetch failed: ' + error.message, 'error');
-			throw error;
-		}
-
-		if (!response.ok) {
-			const errorText = await response.text();
-			log('Proxy import HTTP ' + response.status + ' — ' + errorText.substring(0, 500), 'error');
-			throw new Error('Proxy import failed: ' + response.status);
-		}
-
-		const json = await response.json();
+		const json = await localPost(data);
 		log('Proxy import response success=' + json.success, json.success ? 'success' : 'error');
 		if (!json.success) {
 			logObject('Proxy import response', json, 'error');
@@ -599,41 +835,38 @@
 	}
 
 	/**
-	 * Make remote request
+	 * Make a signed request to a remote site's admin-ajax.php.
 	 */
 	async function remoteRequest(url, data, key) {
 		log('Remote request → ' + (data.action || 'unknown') + ' @ ' + url, 'info');
 		logObject('Remote request payload', data, 'info');
 
-		// Create signature
 		data.sig = await createSignature(data, key);
 
 		let response;
 		try {
 			response = await fetch(url, {
 				method: 'POST',
-				headers: {
-					'Content-Type': 'application/x-www-form-urlencoded',
-				},
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
 				body: new URLSearchParams(data)
 			});
 		} catch (error) {
-			log('Remote fetch failed: ' + error.message + (error.cause ? ' (' + error.cause + ')' : ''), 'error');
-			throw error;
+			const hint = ' — check that the remote site is reachable and CORS is allowed';
+			log('Remote fetch failed: ' + error.message + hint, 'error');
+			const err = new Error(error.message + hint);
+			err.cause = error;
+			throw err;
 		}
 
 		if (!response.ok) {
-			const errorText = await response.text();
-			log('Remote request HTTP ' + response.status + ' — body length ' + errorText.length, 'error');
-			let errorData;
-			try {
-				errorData = JSON.parse(errorText);
-				logObject('Remote error response', errorData, 'error');
-			} catch (e) {
-				log('Remote non-JSON error: ' + errorText.substring(0, 500), 'error');
-				throw new Error(`Request failed: ${response.status} ${response.statusText}`);
-			}
-			throw new Error(errorData.error || errorData.message || `Request failed: ${response.status}`);
+			const errorText = await response.text().catch(function() { return ''; });
+			log('Remote request HTTP ' + response.status + ' — body: ' + errorText.substring(0, 200), 'error');
+			let parsed;
+			try { parsed = JSON.parse(errorText); } catch (e) { parsed = null; }
+			throw new Error(
+				(parsed && (parsed.error || parsed.message)) ||
+				'HTTP ' + response.status + ': ' + errorText.substring(0, 200)
+			);
 		}
 
 		const json = await response.json();
@@ -644,116 +877,35 @@
 		return json;
 	}
 
-	/**
-	 * Create HMAC signature (client-side using Web Crypto API)
-	 * This ensures the signature matches exactly what PHP will receive
-	 */
+	// ── HMAC signing ──────────────────────────────────────────────────────────
+
 	async function createSignature(data, key) {
-		// Remove existing signature and nonce (nonce is verified separately, not in signature)
-		const cleanData = {...data};
+		const cleanData = Object.assign({}, data);
 		delete cleanData.sig;
 		delete cleanData.nonce;
 
-		// Sort data by key (matching PHP ksort)
 		const sortedKeys = Object.keys(cleanData).sort();
 		const sortedData = {};
 		for (const k of sortedKeys) {
 			sortedData[k] = cleanData[k];
 		}
 
-		// Create query string using URLSearchParams (matches how data is sent)
 		const params = new URLSearchParams(sortedData);
 		const queryString = params.toString();
 
-		// Import key for HMAC
 		const encoder = new TextEncoder();
-		const keyData = encoder.encode(key);
 		const cryptoKey = await crypto.subtle.importKey(
 			'raw',
-			keyData,
+			encoder.encode(key),
 			{ name: 'HMAC', hash: 'SHA-256' },
 			false,
 			['sign']
 		);
 
-		// Sign the query string
-		const signatureBuffer = await crypto.subtle.sign(
-			'HMAC',
-			cryptoKey,
-			encoder.encode(queryString)
-		);
-
-		// Convert to hex string (matching PHP hash_hmac output)
-		const signatureArray = Array.from(new Uint8Array(signatureBuffer));
-		const signatureHex = signatureArray.map(b => b.toString(16).padStart(2, '0')).join('');
-
-		return signatureHex;
+		const signatureBuffer = await crypto.subtle.sign('HMAC', cryptoKey, encoder.encode(queryString));
+		return Array.from(new Uint8Array(signatureBuffer))
+			.map(function(b) { return b.toString(16).padStart(2, '0'); })
+			.join('');
 	}
 
-	/**
-	 * Show progress
-	 */
-	function showProgress(percent, text) {
-		if (progressSection) {
-			progressSection.style.display = 'block';
-		}
-		if (progressBarFill) {
-			progressBarFill.style.width = percent + '%';
-			progressBarFill.textContent = Math.round(percent) + '%';
-		}
-		if (progressText) {
-			progressText.textContent = text || '';
-		}
-	}
-
-	/**
-	 * Show error
-	 */
-	function showError(message) {
-		if (!message || message.trim() === '') {
-			hideError();
-			return;
-		}
-		if (errorSection) {
-			errorSection.style.display = 'block';
-		}
-		if (errorMessage) {
-			errorMessage.textContent = message;
-		}
-	}
-
-	/**
-	 * Hide error
-	 */
-	function hideError() {
-		if (errorSection) {
-			errorSection.style.display = 'none';
-		}
-	}
-
-	/**
-	 * Show success
-	 */
-	function showSuccess(message) {
-		if (!message || message.trim() === '') {
-			hideSuccess();
-			return;
-		}
-		if (successSection) {
-			successSection.style.display = 'block';
-		}
-		if (successMessage) {
-			successMessage.textContent = message;
-		}
-	}
-
-	/**
-	 * Hide success
-	 */
-	function hideSuccess() {
-		if (successSection) {
-			successSection.style.display = 'none';
-		}
-	}
 })();
-

@@ -3,7 +3,7 @@
  * Plugin Name: What are you syncing about?
  * Plugin URI: https://github.com/jackmparker/what-are-you-syncing-about
  * Description: A simplified WordPress database migration tool for pushing and pulling databases between sites with automatic URL/path replacement and backups.
- * Version: 1.1.0
+ * Version: 1.2.0
  * Author: Jack Parker
  * Author URI: https://github.com/jackmparker
  * License: GPL v3
@@ -54,7 +54,7 @@ if ( isset( $_REQUEST['action'] ) && strpos( $_REQUEST['action'], 'sync_' ) === 
 }
 
 // Define plugin constants
-define( 'SYNC_VERSION', '1.1.0' );
+define( 'SYNC_VERSION', '1.2.0' );
 define( 'SYNC_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'SYNC_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'SYNC_PLUGIN_BASENAME', plugin_basename( __FILE__ ) );

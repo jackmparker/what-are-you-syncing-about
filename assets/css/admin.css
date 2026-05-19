@@ -278,6 +278,39 @@
 	100% { transform: rotate(360deg); }
 }
 
+/* Advanced Settings */
+.sync-advanced {
+	margin-top: 20px;
+	border: 1px solid #ddd;
+	border-radius: 3px;
+}
+
+.sync-advanced > summary {
+	padding: 10px 14px;
+	cursor: pointer;
+	font-weight: 600;
+	color: #2271b1;
+	list-style: none;
+	user-select: none;
+}
+
+.sync-advanced > summary::-webkit-details-marker { display: none; }
+
+.sync-advanced > summary::before {
+	content: '▶ ';
+	font-size: 0.75em;
+}
+
+.sync-advanced[open] > summary::before {
+	content: '▼ ';
+}
+
+.sync-advanced-body {
+	padding: 14px;
+	border-top: 1px solid #ddd;
+	background: #f9f9f9;
+}
+
 /* Responsive */
 @media screen and (max-width: 782px) {
 	.connection-key-wrapper {

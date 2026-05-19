@@ -68,6 +68,13 @@ class SYNC_Ajax {
 
 		// Server-side proxy for push imports (avoids browser CORS / WAF on raw SQL)
 		add_action( 'wp_ajax_sync_remote_import_chunk', array( $this, 'ajax_remote_import_chunk' ) );
+
+		// Save connection settings (Basic Auth, SSL skip)
+		add_action( 'wp_ajax_sync_save_settings', array( $this, 'ajax_save_settings' ) );
+
+		// Export a batch of small tables in one request
+		add_action( 'wp_ajax_sync_export_batch', array( $this, 'ajax_export_batch' ) );
+		add_action( 'wp_ajax_nopriv_sync_export_batch', array( $this, 'ajax_export_batch' ) );
 	}
 
 	/**
@@ -429,6 +436,7 @@ class SYNC_Ajax {
 
 		// Get site info
 		$info = $this->core->get_site_info();
+		$info['plugin_version'] = SYNC_VERSION;
 
 		$this->send_response( array(
 			'success' => true,
@@ -506,16 +514,23 @@ class SYNC_Ajax {
 		$rows_exported = $export['rows_exported'];
 		$has_more   = ( $offset + $rows_exported ) < $total_rows;
 
-		$this->send_response( array(
-			'success' => true,
-			'sql' => $sql,
-			'offset' => $offset,
+		$response_data = array(
+			'success'       => true,
+			'offset'        => $offset,
 			'rows_exported' => $rows_exported,
-			'total_rows' => $total_rows,
-			'has_more' => $has_more,
-			'chunk_size' => $chunk_size,
-			'sql_bytes' => $export['sql_bytes'],
-		) );
+			'total_rows'    => $total_rows,
+			'has_more'      => $has_more,
+			'chunk_size'    => $chunk_size,
+			'sql_bytes'     => $export['sql_bytes'],
+		);
+
+		if ( function_exists( 'gzencode' ) ) {
+			$response_data['sql_gz_b64'] = base64_encode( gzencode( $sql, 6 ) );
+		} else {
+			$response_data['sql'] = $sql;
+		}
+
+		$this->send_response( $response_data );
 	}
 
 	/**
@@ -564,6 +579,18 @@ class SYNC_Ajax {
 	 * @return string|WP_Error
 	 */
 	private function extract_import_sql( $data ) {
+		if ( ! empty( $data['sql_gz_b64'] ) ) {
+			$compressed = base64_decode( $data['sql_gz_b64'], true );
+			if ( false === $compressed ) {
+				return new WP_Error( 'invalid_sql', 'Invalid base64 in gzip SQL payload' );
+			}
+			$sql = gzdecode( $compressed );
+			if ( false === $sql ) {
+				return new WP_Error( 'invalid_sql', 'Failed to decompress gzip SQL payload' );
+			}
+			return $sql;
+		}
+
 		if ( ! empty( $data['sql_b64'] ) ) {
 			$sql = base64_decode( $data['sql_b64'], true );
 			if ( false === $sql ) {
@@ -608,11 +635,12 @@ class SYNC_Ajax {
 			return;
 		}
 
-		$remote_url = isset( $raw_data['remote_url'] ) ? esc_url_raw( $raw_data['remote_url'] ) : '';
-		$remote_key = isset( $raw_data['key'] ) ? sanitize_text_field( $raw_data['key'] ) : '';
-		$sql        = isset( $raw_data['sql'] ) ? $raw_data['sql'] : '';
+		$remote_url  = isset( $raw_data['remote_url'] ) ? esc_url_raw( $raw_data['remote_url'] ) : '';
+		$remote_key  = isset( $raw_data['key'] ) ? sanitize_text_field( $raw_data['key'] ) : '';
+		$sql_gz_b64  = isset( $raw_data['sql_gz_b64'] ) ? $raw_data['sql_gz_b64'] : '';
+		$sql         = isset( $raw_data['sql'] ) ? $raw_data['sql'] : '';
 
-		if ( empty( $remote_url ) || empty( $remote_key ) || '' === $sql ) {
+		if ( empty( $remote_url ) || empty( $remote_key ) || ( '' === $sql_gz_b64 && '' === $sql ) ) {
 			$this->send_error( 'Missing parameters', 'missing_params' );
 			return;
 		}
@@ -623,13 +651,22 @@ class SYNC_Ajax {
 		$payload = array(
 			'action'        => 'sync_import_chunk',
 			'key'           => $remote_key,
-			'sql_b64'       => base64_encode( $sql ),
 			'old_url'       => isset( $raw_data['old_url'] ) ? esc_url_raw( $raw_data['old_url'] ) : '',
 			'new_url'       => isset( $raw_data['new_url'] ) ? esc_url_raw( $raw_data['new_url'] ) : '',
 			'old_path'      => isset( $raw_data['old_path'] ) ? sanitize_text_field( $raw_data['old_path'] ) : '',
 			'new_path'      => isset( $raw_data['new_path'] ) ? sanitize_text_field( $raw_data['new_path'] ) : '',
 			'source_prefix' => isset( $raw_data['source_prefix'] ) ? sanitize_text_field( $raw_data['source_prefix'] ) : '',
 		);
+
+		// If the browser already gzip-encoded the SQL, pass it through without re-processing.
+		// Otherwise compress now (or fall back to plain base64).
+		if ( $sql_gz_b64 !== '' ) {
+			$payload['sql_gz_b64'] = $sql_gz_b64;
+		} elseif ( function_exists( 'gzencode' ) ) {
+			$payload['sql_gz_b64'] = base64_encode( gzencode( $sql, 6 ) );
+		} else {
+			$payload['sql_b64'] = base64_encode( $sql );
+		}
 
 		$result = $this->remote_post( $ajax_url, $payload, $remote_key );
 
@@ -803,25 +840,124 @@ class SYNC_Ajax {
 		unset( $data['sig'] );
 		$data['sig'] = SYNC_Security::create_signature( $data, $key );
 
-		// Make request
-		$response = wp_remote_post( $url, array(
-			'timeout' => 600,
-			'body' => $data,
-			'sslverify' => ! SYNC_Security::is_localhost( $url ),
-		) );
+		$settings  = get_option( 'sync_settings', array() );
+		$skip_ssl  = ! empty( $settings['skip_ssl'] );
+		$basic_user = isset( $settings['basic_auth_user'] ) ? $settings['basic_auth_user'] : '';
+		$basic_pass = isset( $settings['basic_auth_pass'] ) ? $settings['basic_auth_pass'] : '';
+
+		$args = array(
+			'timeout'   => 600,
+			'body'      => $data,
+			'sslverify' => ( $skip_ssl || SYNC_Security::is_localhost( $url ) ) ? false : true,
+		);
+
+		if ( $basic_user !== '' ) {
+			$args['headers']['Authorization'] = 'Basic ' . base64_encode( $basic_user . ':' . $basic_pass );
+		}
+
+		$response = wp_remote_post( $url, $args );
 
 		if ( is_wp_error( $response ) ) {
 			return $response;
 		}
 
-		$body = wp_remote_retrieve_body( $response );
+		$status = wp_remote_retrieve_response_code( $response );
+		$body   = wp_remote_retrieve_body( $response );
+
+		if ( $status === 403 || ( is_string( $body ) && stripos( $body, 'Access Denied' ) !== false ) ) {
+			return new WP_Error(
+				'waf_blocked',
+				"HTTP {$status}: request blocked by WAF or firewall. Try adding the remote site's admin-ajax.php to your WAF allowlist, or check if the remote site requires HTTP Basic Auth credentials."
+			);
+		}
+
 		$decoded = json_decode( $body, true );
 
 		if ( json_last_error() !== JSON_ERROR_NONE ) {
-			return new WP_Error( 'invalid_response', 'Invalid JSON response: ' . $body );
+			return new WP_Error(
+				'invalid_response',
+				"HTTP {$status}: non-JSON response from remote site: " . substr( $body, 0, 500 )
+			);
 		}
 
 		return $decoded;
+	}
+
+	/**
+	 * Save connection settings (Basic Auth credentials, SSL skip).
+	 */
+	public function ajax_save_settings() {
+		check_ajax_referer( 'sync_nonce', 'nonce' );
+
+		if ( ! current_user_can( 'manage_options' ) ) {
+			$this->send_error( 'Insufficient permissions', 'forbidden', 403 );
+			return;
+		}
+
+		$settings = get_option( 'sync_settings', array() );
+
+		$settings['basic_auth_user'] = sanitize_text_field( isset( $_POST['basic_auth_user'] ) ? $_POST['basic_auth_user'] : '' );
+		$settings['basic_auth_pass'] = sanitize_text_field( isset( $_POST['basic_auth_pass'] ) ? $_POST['basic_auth_pass'] : '' );
+		$settings['skip_ssl']        = ! empty( $_POST['skip_ssl'] );
+		$concurrency                 = isset( $_POST['concurrency'] ) ? (int) $_POST['concurrency'] : 3;
+		$settings['concurrency']     = max( 1, min( 10, $concurrency ) );
+
+		update_option( 'sync_settings', $settings );
+
+		$this->send_response( array( 'success' => true ) );
+	}
+
+	/**
+	 * Export a batch of small tables as a single combined SQL payload.
+	 */
+	public function ajax_export_batch() {
+		$this->maybe_send_cors_headers();
+
+		$remote_key = isset( $_POST['key'] ) ? sanitize_text_field( $_POST['key'] ) : '';
+		$tables_raw = isset( $_POST['tables'] ) ? wp_unslash( $_POST['tables'] ) : '';
+
+		if ( empty( $remote_key ) || empty( $tables_raw ) ) {
+			$this->send_error( 'Missing parameters', 'missing_params' );
+			return;
+		}
+
+		$verify = $this->verify_request( $remote_key );
+		if ( is_wp_error( $verify ) ) {
+			$this->send_error( $verify->get_error_message(), $verify->get_error_code() );
+			return;
+		}
+
+		$tables = json_decode( $tables_raw, true );
+		if ( ! is_array( $tables ) ) {
+			$this->send_error( 'Invalid tables parameter', 'invalid_params' );
+			return;
+		}
+
+		// Validate: only export tables that actually exist
+		$known_tables = $this->core->get_tables();
+		$safe_tables  = array_values( array_intersect( $tables, $known_tables ) );
+
+		@ini_set( 'memory_limit', '512M' );
+		@set_time_limit( 300 );
+
+		$combined_sql = '';
+		foreach ( $safe_tables as $table ) {
+			// PHP_INT_MAX: export all rows (small tables, so no memory concern)
+			$combined_sql .= $this->core->export_table( $table, 0, PHP_INT_MAX );
+		}
+
+		$response_data = array(
+			'success'         => true,
+			'tables_exported' => $safe_tables,
+		);
+
+		if ( function_exists( 'gzencode' ) ) {
+			$response_data['sql_gz_b64'] = base64_encode( gzencode( $combined_sql, 6 ) );
+		} else {
+			$response_data['sql'] = $combined_sql;
+		}
+
+		$this->send_response( $response_data );
 	}
 }
 

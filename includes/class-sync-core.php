@@ -511,6 +511,8 @@ class SYNC_Core {
 	 * @return string|WP_Error Backup file path or error
 	 */
 	public function create_backup() {
+		global $wpdb;
+
 		$this->log_activity( "Starting database backup" );
 
 		$upload_dir = wp_upload_dir();
@@ -518,6 +520,23 @@ class SYNC_Core {
 
 		if ( ! file_exists( $backup_dir ) ) {
 			wp_mkdir_p( $backup_dir );
+		}
+
+		// Check available disk space before writing
+		$db_bytes = (int) $wpdb->get_var( $wpdb->prepare(
+			"SELECT SUM(data_length + index_length) FROM information_schema.tables WHERE table_schema = %s",
+			DB_NAME
+		) );
+		$free_space = function_exists( 'disk_free_space' ) ? disk_free_space( $backup_dir ) : false;
+		if ( $free_space !== false && $db_bytes > 0 && $free_space < $db_bytes * 1.2 ) {
+			return new WP_Error(
+				'insufficient_disk_space',
+				sprintf(
+					'Insufficient disk space for backup. Database is ~%s, available: %s.',
+					$this->format_bytes( $db_bytes ),
+					$this->format_bytes( (int) $free_space )
+				)
+			);
 		}
 
 		$timestamp = date( 'Ymd-His' );
@@ -586,10 +605,25 @@ class SYNC_Core {
 		}
 		$data = str_replace( $old_path, $new_path, $data );
 
-		// Handle serialized data (only if we detect serialized patterns)
-		if ( strpos( $data, 's:' ) !== false || strpos( $data, 'a:' ) !== false ) {
-			$this->log_activity( "Processing serialized data" );
-			$data = $this->process_serialized_data( $data, $old_url, $new_url, $old_path, $new_path );
+		// Handle protocol-relative URLs (e.g. //old.com/path → //new.com/path)
+		$old_proto_relative = '//' . $old_url_no_protocol;
+		$new_proto_relative = '//' . $new_url_no_protocol;
+		if ( $old_proto_relative !== $new_proto_relative ) {
+			$data = str_replace( $old_proto_relative, $new_proto_relative, $data );
+		}
+
+		// Handle opposite-protocol variant of source URL (e.g. http:// copies of https:// source)
+		if ( strpos( $old_url, 'https://' ) === 0 ) {
+			$old_http_url = 'http://' . $old_url_no_protocol;
+			if ( $old_http_url !== $new_url ) {
+				$data = str_replace( $old_http_url, $new_url, $data );
+			}
+		}
+
+		// Fix s:N:"..." byte counts that became stale after str_replace changed URL lengths.
+		// Only needed when old and new have different lengths.
+		if ( strlen( $old_url ) !== strlen( $new_url ) || strlen( $old_path ) !== strlen( $new_path ) ) {
+			$data = $this->fix_serialized_string_lengths( $data );
 		}
 
 		$this->log_activity( "URL/path replacement complete" );
@@ -598,68 +632,25 @@ class SYNC_Core {
 	}
 
 	/**
-	 * Process serialized PHP data
-	 *
-	 * @param string $data Serialized data
-	 * @param string $old_url Old URL
-	 * @param string $new_url New URL
-	 * @param string $old_path Old file path
-	 * @param string $new_path New file path
-	 * @return string
+	 * Recalculate s:N:"..." byte counts after text replacement may have changed string lengths.
+	 * Works on raw SQL export text. Handles most WordPress serialized data; edge cases involving
+	 * serialized strings that themselves contain unescaped double-quotes are not addressed.
 	 */
-	private function process_serialized_data( $data, $old_url, $new_url, $old_path, $new_path ) {
-		// Check if data is serialized
-		if ( ! is_serialized( $data ) ) {
+	private function fix_serialized_string_lengths( $data ) {
+		if ( strpos( $data, 's:' ) === false ) {
 			return $data;
 		}
-
-		// Unserialize
-		$unserialized = @unserialize( $data );
-		if ( $unserialized === false ) {
-			return $data;
-		}
-
-		// Recursively replace
-		$unserialized = $this->recursive_replace( $unserialized, $old_url, $new_url, $old_path, $new_path );
-
-		// Reserialize
-		return serialize( $unserialized );
-	}
-
-	/**
-	 * Recursively replace URLs and paths in array/object
-	 *
-	 * @param mixed $data Data to process
-	 * @param string $old_url Old URL
-	 * @param string $new_url New URL
-	 * @param string $old_path Old file path
-	 * @param string $new_path New file path
-	 * @return mixed
-	 */
-	private function recursive_replace( $data, $old_url, $new_url, $old_path, $new_path ) {
-		if ( is_array( $data ) ) {
-			foreach ( $data as $key => $value ) {
-				$data[ $key ] = $this->recursive_replace( $value, $old_url, $new_url, $old_path, $new_path );
-			}
-		} elseif ( is_object( $data ) ) {
-			foreach ( $data as $key => $value ) {
-				$data->$key = $this->recursive_replace( $value, $old_url, $new_url, $old_path, $new_path );
-			}
-		} elseif ( is_string( $data ) ) {
-			$old_url_no_protocol = preg_replace( '#^https?://#', '', $old_url );
-			$new_url_no_protocol = preg_replace( '#^https?://#', '', $new_url );
-
-			$data = str_replace( $old_url, $new_url, $data );
-			if ( $old_url_no_protocol !== $new_url_no_protocol && strlen( $new_url_no_protocol ) > 0 ) {
-				$host_protect = '~SYNC~' . md5( $old_url_no_protocol . '|' . $new_url_no_protocol ) . '~SYNC~';
-				$data         = str_replace( $new_url_no_protocol, $host_protect, $data );
-				$data         = str_replace( $old_url_no_protocol, $new_url_no_protocol, $data );
-				$data         = str_replace( $host_protect, $new_url_no_protocol, $data );
-			}
-			$data = str_replace( $old_path, $new_path, $data );
-		}
-
-		return $data;
+		return preg_replace_callback(
+			'/s:(\d+):"((?:[^"\\\\]|\\\\.)*)";/',
+			function( $matches ) {
+				$new_len = strlen( $matches[2] );
+				if ( (int) $matches[1] !== $new_len ) {
+					return 's:' . $new_len . ':"' . $matches[2] . '";';
+				}
+				return $matches[0];
+			},
+			$data
+		);
 	}
 
 	/**
@@ -905,16 +896,38 @@ class SYNC_Core {
 	 * @return array
 	 */
 	public function get_site_info() {
-		$upload_dir = wp_upload_dir();
+		global $wpdb;
+
+		$upload_dir   = wp_upload_dir();
+		$table_prefix = $this->get_table_prefix();
+
+		// Fetch per-table byte sizes in a single query
+		$size_rows = $wpdb->get_results( $wpdb->prepare(
+			"SELECT table_name, COALESCE(data_length + index_length, 0) AS total_bytes
+			 FROM information_schema.tables
+			 WHERE table_schema = %s AND table_name LIKE %s",
+			DB_NAME,
+			$wpdb->esc_like( $table_prefix ) . '%'
+		), ARRAY_A );
+
+		$table_sizes = array();
+		if ( $size_rows ) {
+			foreach ( $size_rows as $row ) {
+				$table_sizes[ $row['table_name'] ] = (int) $row['total_bytes'];
+			}
+		}
 
 		return array(
-			'url' => home_url(),
-			'path' => ABSPATH,
-			'upload_url' => $upload_dir['url'],
+			'url'         => home_url(),
+			'path'        => ABSPATH,
+			'upload_url'  => $upload_dir['url'],
 			'upload_path' => $upload_dir['basedir'],
-			'tables' => $this->get_tables(),
-			'prefix' => $this->get_table_prefix(),
-			'version' => get_bloginfo( 'version' ),
+			'tables'      => $this->get_tables(),
+			'prefix'      => $table_prefix,
+			'version'     => get_bloginfo( 'version' ),
+			'table_sizes' => $table_sizes,
+			'db_charset'  => $wpdb->charset,
+			'db_collate'  => $wpdb->collate,
 		);
 	}
 
