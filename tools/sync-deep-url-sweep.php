@@ -2,19 +2,19 @@
 /**
  * Find or replace a bad hostname substring across ALL matching DB columns (not just core tables).
  *
- * Use when the site still redirects after tools/vayz-emergency-url-fix.php — leftover rows,
+ * Use when the site still redirects after tools/sync-emergency-url-fix.php — leftover rows,
  * plugin tables, or serialized blobs often still contain the bad host.
  *
  * SETUP: Edit $secret, $bad_host, $good_host below (must match your real hostnames).
  *
  * USAGE (WordPress root, same host DNS resolves to, e.g. dev.carterparkdental.com):
- *   Scan only:  .../vayz-deep-url-sweep.php?key=SECRET&mode=scan
- *   Apply fix:  .../vayz-deep-url-sweep.php?key=SECRET&mode=fix
+ *   Scan only:  .../sync-deep-url-sweep.php?key=SECRET&mode=scan
+ *   Apply fix:  .../sync-deep-url-sweep.php?key=SECRET&mode=fix
  *
  * After fix: delete this file. If scan shows 0 hits everywhere, the redirect is NOT
  * from the DB (see non-DB checklist in output).
  *
- * @package VAYZ
+ * @package SYNC
  */
 
 $secret    = 'dnifsdonifds8hfds8fdshoiufdsnof43nri93niofdniofdsniofdsghgfjhgjhg';
@@ -37,7 +37,7 @@ if ( ! isset( $_GET['key'] ) || ! hash_equals( $secret, (string) $_GET['key'] ) 
 }
 
 header( 'Content-Type: text/plain; charset=utf-8' );
-echo "vayz-deep-url-sweep: authenticated, loading WordPress (minimal)…\n";
+echo "sync-deep-url-sweep: authenticated, loading WordPress (minimal)…\n";
 if ( function_exists( 'ob_get_level' ) && ob_get_level() > 0 ) {
 	@ob_end_flush();
 }

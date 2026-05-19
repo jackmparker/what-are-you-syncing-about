@@ -9,12 +9,13 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-class VAYZ_Core {
+class SYNC_Core {
 
 	private static $instance = null;
-	private $temp_prefix = '_vayz_temp_';
+	private $temp_prefix = '_sync_temp_';
 	private $chunk_size = 1000; // Default rows per chunk (can be dynamically adjusted)
-	private $finalize_guard_option = 'vayz_finalize_guard';
+	private $max_export_chunk_bytes = 524288; // 512KB max SQL per chunk (avoids timeouts / post limits)
+	private $finalize_guard_option = 'sync_finalize_guard';
 	private $activity_log = array();
 	private $start_time = 0;
 	private $debug_enabled = false;
@@ -22,7 +23,7 @@ class VAYZ_Core {
 	/**
 	 * Get singleton instance
 	 *
-	 * @return VAYZ_Core
+	 * @return SYNC_Core
 	 */
 	public static function get_instance() {
 		if ( null === self::$instance ) {
@@ -67,7 +68,7 @@ class VAYZ_Core {
 
 		// Also log to error log if debug is enabled
 		if ( $this->debug_enabled ) {
-			error_log( sprintf( 'VAYZ [%s] %s (%.2fs, %s)', $level, $message, $elapsed, $memory ) );
+			error_log( sprintf( 'SYNC [%s] %s (%.2fs, %s)', $level, $message, $elapsed, $memory ) );
 		}
 	}
 
@@ -176,16 +177,30 @@ class VAYZ_Core {
 	 * @return string SQL statements
 	 */
 	public function export_table( $table, $offset = 0, $limit = null ) {
+		$result = $this->export_table_rows( $table, $offset, $limit );
+		return $result['sql'];
+	}
+
+	/**
+	 * Export a table chunk with row count metadata.
+	 *
+	 * @param string   $table  Table name.
+	 * @param int      $offset Row offset.
+	 * @param int|null $limit  Row limit.
+	 * @return array{sql: string, rows_exported: int}
+	 */
+	public function export_table_rows( $table, $offset = 0, $limit = null ) {
 		global $wpdb;
 
 		if ( null === $limit ) {
 			$limit = $this->chunk_size;
 		}
 
-		$sql = '';
+		$sql           = '';
+		$rows_exported = 0;
 
 		// Get table structure
-		if ( $offset === 0 ) {
+		if ( 0 === $offset ) {
 			$this->log_activity( "Exporting table structure for {$table}" );
 			$create_table = $wpdb->get_row( "SHOW CREATE TABLE `{$table}`", ARRAY_N );
 			if ( $create_table ) {
@@ -197,41 +212,91 @@ class VAYZ_Core {
 		// Get table data
 		$this->log_activity( "Exporting rows from {$table} (offset: {$offset}, limit: {$limit})" );
 		$query = "SELECT * FROM `{$table}` LIMIT %d OFFSET %d";
-		$rows = $wpdb->get_results( $wpdb->prepare( $query, $limit, $offset ), ARRAY_A );
+		$rows  = $wpdb->get_results( $wpdb->prepare( $query, $limit, $offset ), ARRAY_A );
 
 		if ( empty( $rows ) ) {
-			return $sql;
+			return array(
+				'sql'           => $sql,
+				'rows_exported' => 0,
+			);
 		}
 
 		// Get column names
-		$columns = array_keys( $rows[0] );
+		$columns     = array_keys( $rows[0] );
 		$column_list = '`' . implode( '`, `', $columns ) . '`';
 
 		// Build INSERT statements with proper escaping
 		foreach ( $rows as $row ) {
 			$escaped_values = array();
 
-			foreach ( $row as $column_name => $value ) {
-				if ( $value === null ) {
+			foreach ( $row as $value ) {
+				if ( null === $value ) {
 					$escaped_values[] = 'NULL';
 				} else {
-					// Escape with esc_sql (handles quotes, backslashes, etc.)
 					$escaped = esc_sql( $value );
-
-					// Manually escape newlines and carriage returns for SQL string literals
 					$escaped = str_replace( array( "\n", "\r" ), array( "\\n", "\\r" ), $escaped );
-
 					$escaped_values[] = "'" . $escaped . "'";
 				}
 			}
 
 			$values_sql = implode( ', ', $escaped_values );
-			$sql .= "INSERT INTO `{$table}` ({$column_list}) VALUES ( {$values_sql} );\n";
+			$sql       .= "INSERT INTO `{$table}` ({$column_list}) VALUES ( {$values_sql} );\n";
+			$rows_exported++;
 		}
 
-		$this->log_activity( "Exported " . count( $rows ) . " rows from {$table}" );
+		$this->log_activity( "Exported {$rows_exported} rows from {$table}" );
 
-		return $sql;
+		return array(
+			'sql'           => $sql,
+			'rows_exported' => $rows_exported,
+		);
+	}
+
+	/**
+	 * Export rows up to max byte size (shrinks row limit when rows are large, e.g. wp_options).
+	 *
+	 * @param string $table         Table name.
+	 * @param int    $offset        Row offset.
+	 * @param int    $initial_limit Starting row limit.
+	 * @return array{sql: string, rows_exported: int, chunk_size: int, sql_bytes: int}
+	 */
+	public function export_table_bounded( $table, $offset, $initial_limit ) {
+		$limit        = max( 1, (int) $initial_limit );
+		$max_bytes    = $this->max_export_chunk_bytes;
+		$max_attempts = 12;
+
+		for ( $attempt = 0; $attempt < $max_attempts; $attempt++ ) {
+			$result    = $this->export_table_rows( $table, $offset, $limit );
+			$sql_bytes = strlen( $result['sql'] );
+
+			if ( $sql_bytes <= $max_bytes || $limit <= 1 ) {
+				if ( $sql_bytes > $max_bytes ) {
+					$this->log_activity(
+						"Chunk for {$table} at offset {$offset} is {$sql_bytes} bytes (single row may exceed limit)",
+						'warning'
+					);
+				}
+
+				return array(
+					'sql'           => $result['sql'],
+					'rows_exported' => $result['rows_exported'],
+					'chunk_size'    => $limit,
+					'sql_bytes'     => $sql_bytes,
+				);
+			}
+
+			$limit = max( 1, (int) floor( $limit / 2 ) );
+			$this->log_activity( "Reducing {$table} chunk to {$limit} rows (last export was {$sql_bytes} bytes)" );
+		}
+
+		$result = $this->export_table_rows( $table, $offset, 1 );
+
+		return array(
+			'sql'           => $result['sql'],
+			'rows_exported' => $result['rows_exported'],
+			'chunk_size'    => 1,
+			'sql_bytes'     => strlen( $result['sql'] ),
+		);
 	}
 
 	/**
@@ -341,7 +406,7 @@ class VAYZ_Core {
 				$this->log_activity( $error_msg, 'error' );
 
 				if ( $this->debug_enabled ) {
-					error_log( 'VAYZ ERROR import_chunk - Failed statement SQL: ' . $statement );
+					error_log( 'SYNC ERROR import_chunk - Failed statement SQL: ' . $statement );
 				}
 
 				return new WP_Error( 'import_failed', $wpdb->last_error, array( 'statement' => $statement ) );
@@ -449,7 +514,7 @@ class VAYZ_Core {
 		$this->log_activity( "Starting database backup" );
 
 		$upload_dir = wp_upload_dir();
-		$backup_dir = $upload_dir['basedir'] . '/vat-are-you-zinking-about';
+		$backup_dir = $upload_dir['basedir'] . '/what-are-you-syncing-about';
 
 		if ( ! file_exists( $backup_dir ) ) {
 			wp_mkdir_p( $backup_dir );
@@ -514,7 +579,7 @@ class VAYZ_Core {
 		// a naive no-protocol replace would corrupt already-replaced URLs (example.com
 		// matches inside dev.example.com). Protect the new host, then replace, then restore.
 		if ( $old_url_no_protocol !== $new_url_no_protocol && strlen( $new_url_no_protocol ) > 0 ) {
-			$host_protect = '~VAYZ~' . md5( $old_url_no_protocol . '|' . $new_url_no_protocol ) . '~VAYZ~';
+			$host_protect = '~SYNC~' . md5( $old_url_no_protocol . '|' . $new_url_no_protocol ) . '~SYNC~';
 			$data         = str_replace( $new_url_no_protocol, $host_protect, $data );
 			$data         = str_replace( $old_url_no_protocol, $new_url_no_protocol, $data );
 			$data         = str_replace( $host_protect, $new_url_no_protocol, $data );
@@ -586,7 +651,7 @@ class VAYZ_Core {
 
 			$data = str_replace( $old_url, $new_url, $data );
 			if ( $old_url_no_protocol !== $new_url_no_protocol && strlen( $new_url_no_protocol ) > 0 ) {
-				$host_protect = '~VAYZ~' . md5( $old_url_no_protocol . '|' . $new_url_no_protocol ) . '~VAYZ~';
+				$host_protect = '~SYNC~' . md5( $old_url_no_protocol . '|' . $new_url_no_protocol ) . '~SYNC~';
 				$data         = str_replace( $new_url_no_protocol, $host_protect, $data );
 				$data         = str_replace( $old_url_no_protocol, $new_url_no_protocol, $data );
 				$data         = str_replace( $host_protect, $new_url_no_protocol, $data );
@@ -660,7 +725,7 @@ class VAYZ_Core {
 				$this->log_activity( $error_msg, 'error' );
 
 				if ( $this->debug_enabled ) {
-					error_log( 'VAYZ ERROR finalize_migration - SQL: ' . $sql );
+					error_log( 'SYNC ERROR finalize_migration - SQL: ' . $sql );
 				}
 
 				$this->rollback_from_guard( get_option( $this->finalize_guard_option, array() ) );
@@ -720,15 +785,15 @@ class VAYZ_Core {
 			return true;
 		}
 
-		error_log( 'VAYZ ERROR maybe_auto_rollback - Detected unhealthy core tables; attempting rollback: ' . $health->get_error_message() );
+		error_log( 'SYNC ERROR maybe_auto_rollback - Detected unhealthy core tables; attempting rollback: ' . $health->get_error_message() );
 		$ok = $this->rollback_from_guard( $guard );
 		if ( $ok ) {
-			error_log( 'VAYZ INFO maybe_auto_rollback - Rollback completed.' );
+			error_log( 'SYNC INFO maybe_auto_rollback - Rollback completed.' );
 			delete_option( $this->finalize_guard_option );
 			return true;
 		}
 
-		error_log( 'VAYZ ERROR maybe_auto_rollback - Rollback failed; manual restore may be required.' );
+		error_log( 'SYNC ERROR maybe_auto_rollback - Rollback failed; manual restore may be required.' );
 		return false;
 	}
 
@@ -758,8 +823,8 @@ class VAYZ_Core {
 				$r = $wpdb->query( $sql );
 				if ( $r === false ) {
 					$all_ok = false;
-					error_log( 'VAYZ ERROR rollback_from_guard - Failed rollback rename: ' . $wpdb->last_error );
-					error_log( 'VAYZ ERROR rollback_from_guard - SQL: ' . $sql );
+					error_log( 'SYNC ERROR rollback_from_guard - Failed rollback rename: ' . $wpdb->last_error );
+					error_log( 'SYNC ERROR rollback_from_guard - SQL: ' . $sql );
 				}
 				continue;
 			}
@@ -770,8 +835,8 @@ class VAYZ_Core {
 				$r = $wpdb->query( $sql );
 				if ( $r === false ) {
 					$all_ok = false;
-					error_log( 'VAYZ ERROR rollback_from_guard - Failed rollback rename (no backup): ' . $wpdb->last_error );
-					error_log( 'VAYZ ERROR rollback_from_guard - SQL: ' . $sql );
+					error_log( 'SYNC ERROR rollback_from_guard - Failed rollback rename (no backup): ' . $wpdb->last_error );
+					error_log( 'SYNC ERROR rollback_from_guard - SQL: ' . $sql );
 				}
 			}
 		}

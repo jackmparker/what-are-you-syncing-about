@@ -1,4 +1,4 @@
-# Vat are you zinking about?
+# What are you syncing about?
 
 A WordPress database migration tool for pushing and pulling databases between sites with automatic URL/path replacement and backups. Vibe-coded – use at your own risk!
 
@@ -25,9 +25,13 @@ A WordPress database migration tool for pushing and pulling databases between si
 
 ## Installation
 
-1. Upload the plugin folder to `/wp-content/plugins/`
+1. Upload the `what-are-you-syncing-about` folder to `/wp-content/plugins/`
 2. Activate the plugin through the 'Plugins' menu in WordPress
-3. Go to Tools → Vat are you zinking about?
+3. Go to Tools → What are you syncing about?
+
+### Upgrading from vat-are-you-zinking-about
+
+On activate, the plugin migrates your connection key (`vayz_settings` → `sync_settings`), backup folder under uploads, and any in-progress migration state. **Push and pull require both sites to run 1.1.0+** (AJAX actions use the `sync_` prefix). Either rename the plugin folder in place on each site or deactivate the old plugin, install this folder, and activate.
 
 ## Usage
 
@@ -59,6 +63,11 @@ A WordPress database migration tool for pushing and pulling databases between si
 - **Progress Tracking**: Real-time progress updates with row counts
 
 ## Changelog
+
+### 1.1.0
+- Renamed plugin to What are you syncing about? (`what-are-you-syncing-about`)
+- Replaced `vayz` / `VAYZ` internals with `sync` / `SYNC`
+- One-time upgrade for existing installs (settings, backups, migration state)
 
 ### 1.0.0
 - Initial release with performance optimizations

@@ -9,7 +9,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-class VAYZ_Ajax {
+class SYNC_Ajax {
 
 	private static $instance = null;
 	private $core;
@@ -17,7 +17,7 @@ class VAYZ_Ajax {
 	/**
 	 * Get singleton instance
 	 *
-	 * @return VAYZ_Ajax
+	 * @return SYNC_Ajax
 	 */
 	public static function get_instance() {
 		if ( null === self::$instance ) {
@@ -30,7 +30,7 @@ class VAYZ_Ajax {
 	 * Constructor
 	 */
 	private function __construct() {
-		$this->core = VAYZ_Core::get_instance();
+		$this->core = SYNC_Core::get_instance();
 
 		// Send CORS headers immediately if this is an AJAX request for our plugin
 		$this->maybe_send_cors_now();
@@ -48,23 +48,26 @@ class VAYZ_Ajax {
 		add_action( 'template_redirect', array( $this, 'send_cors_headers_early' ), 1 );
 
 		// Internal AJAX handlers (require authentication)
-		add_action( 'wp_ajax_vayz_verify_connection', array( $this, 'ajax_verify_connection' ) );
-		add_action( 'wp_ajax_vayz_get_connection_info', array( $this, 'ajax_get_connection_info' ) );
-		add_action( 'wp_ajax_vayz_initiate_migration', array( $this, 'ajax_initiate_migration' ) );
-		add_action( 'wp_ajax_vayz_export_chunk', array( $this, 'ajax_export_chunk' ) );
-		add_action( 'wp_ajax_vayz_import_chunk', array( $this, 'ajax_import_chunk' ) );
-		add_action( 'wp_ajax_vayz_finalize_migration', array( $this, 'ajax_finalize_migration' ) );
+		add_action( 'wp_ajax_sync_verify_connection', array( $this, 'ajax_verify_connection' ) );
+		add_action( 'wp_ajax_sync_get_connection_info', array( $this, 'ajax_get_connection_info' ) );
+		add_action( 'wp_ajax_sync_initiate_migration', array( $this, 'ajax_initiate_migration' ) );
+		add_action( 'wp_ajax_sync_export_chunk', array( $this, 'ajax_export_chunk' ) );
+		add_action( 'wp_ajax_sync_import_chunk', array( $this, 'ajax_import_chunk' ) );
+		add_action( 'wp_ajax_sync_finalize_migration', array( $this, 'ajax_finalize_migration' ) );
 
 		// External AJAX handlers (no authentication required, but signature verified)
-		add_action( 'wp_ajax_nopriv_vayz_verify_connection', array( $this, 'ajax_verify_connection' ) );
-		add_action( 'wp_ajax_nopriv_vayz_get_connection_info', array( $this, 'ajax_get_connection_info' ) );
-		add_action( 'wp_ajax_nopriv_vayz_initiate_migration', array( $this, 'ajax_initiate_migration' ) );
-		add_action( 'wp_ajax_nopriv_vayz_export_chunk', array( $this, 'ajax_export_chunk' ) );
-		add_action( 'wp_ajax_nopriv_vayz_import_chunk', array( $this, 'ajax_import_chunk' ) );
-		add_action( 'wp_ajax_nopriv_vayz_finalize_migration', array( $this, 'ajax_finalize_migration' ) );
+		add_action( 'wp_ajax_nopriv_sync_verify_connection', array( $this, 'ajax_verify_connection' ) );
+		add_action( 'wp_ajax_nopriv_sync_get_connection_info', array( $this, 'ajax_get_connection_info' ) );
+		add_action( 'wp_ajax_nopriv_sync_initiate_migration', array( $this, 'ajax_initiate_migration' ) );
+		add_action( 'wp_ajax_nopriv_sync_export_chunk', array( $this, 'ajax_export_chunk' ) );
+		add_action( 'wp_ajax_nopriv_sync_import_chunk', array( $this, 'ajax_import_chunk' ) );
+		add_action( 'wp_ajax_nopriv_sync_finalize_migration', array( $this, 'ajax_finalize_migration' ) );
 
 		// Helper endpoint for creating signatures (requires authentication)
-		add_action( 'wp_ajax_vayz_create_signature', array( $this, 'ajax_create_signature' ) );
+		add_action( 'wp_ajax_sync_create_signature', array( $this, 'ajax_create_signature' ) );
+
+		// Server-side proxy for push imports (avoids browser CORS / WAF on raw SQL)
+		add_action( 'wp_ajax_sync_remote_import_chunk', array( $this, 'ajax_remote_import_chunk' ) );
 	}
 
 	/**
@@ -81,7 +84,7 @@ class VAYZ_Ajax {
 
 		// Check if this is our AJAX action
 		$action = isset( $_REQUEST['action'] ) ? $_REQUEST['action'] : '';
-		if ( strpos( $action, 'vayz_' ) !== 0 ) {
+		if ( strpos( $action, 'sync_' ) !== 0 ) {
 			return;
 		}
 
@@ -104,7 +107,7 @@ class VAYZ_Ajax {
 
 		// Check if this is our AJAX action
 		$action = isset( $_REQUEST['action'] ) ? $_REQUEST['action'] : '';
-		if ( strpos( $action, 'vayz_' ) !== 0 ) {
+		if ( strpos( $action, 'sync_' ) !== 0 ) {
 			return $headers;
 		}
 
@@ -123,8 +126,8 @@ class VAYZ_Ajax {
 
 		// Add CORS headers
 		if ( empty( $origin ) || $origin === '*' ||
-			 VAYZ_Security::is_localhost( $origin ) ||
-			 VAYZ_Security::is_localhost( home_url() ) ||
+			 SYNC_Security::is_localhost( $origin ) ||
+			 SYNC_Security::is_localhost( home_url() ) ||
 			 strpos( $origin, 'localhost' ) !== false ||
 			 strpos( $origin, '127.0.0.1' ) !== false ) {
 
@@ -158,7 +161,7 @@ class VAYZ_Ajax {
 
 		// Check if this is our AJAX action
 		$action = isset( $_REQUEST['action'] ) ? $_REQUEST['action'] : '';
-		if ( strpos( $action, 'vayz_' ) !== 0 ) {
+		if ( strpos( $action, 'sync_' ) !== 0 ) {
 			return;
 		}
 
@@ -173,7 +176,7 @@ class VAYZ_Ajax {
 		// Check if this is an AJAX request for our plugin
 		$action = isset( $_REQUEST['action'] ) ? $_REQUEST['action'] : '';
 
-		if ( strpos( $action, 'vayz_' ) !== 0 ) {
+		if ( strpos( $action, 'sync_' ) !== 0 ) {
 			return;
 		}
 
@@ -205,8 +208,8 @@ class VAYZ_Ajax {
 
 		// For localhost or any origin during development
 		if ( empty( $origin ) || $origin === '*' ||
-			 VAYZ_Security::is_localhost( $origin ) ||
-			 VAYZ_Security::is_localhost( home_url() ) ||
+			 SYNC_Security::is_localhost( $origin ) ||
+			 SYNC_Security::is_localhost( home_url() ) ||
 			 strpos( $origin, 'localhost' ) !== false ||
 			 strpos( $origin, '127.0.0.1' ) !== false ) {
 
@@ -242,7 +245,7 @@ class VAYZ_Ajax {
 	 * Create signature for client-side requests
 	 */
 	public function ajax_create_signature() {
-		check_ajax_referer( 'vayz_nonce', 'nonce' );
+		check_ajax_referer( 'sync_nonce', 'nonce' );
 
 		$this->maybe_send_cors_headers();
 
@@ -258,7 +261,7 @@ class VAYZ_Ajax {
 		// Parse the URL-encoded string into an array (same format as $_POST)
 		parse_str( $data_string, $data );
 
-		$signature = VAYZ_Security::create_signature( $data, $key );
+		$signature = SYNC_Security::create_signature( $data, $key );
 
 		wp_send_json_success( array( 'signature' => $signature ) );
 	}
@@ -290,14 +293,14 @@ class VAYZ_Ajax {
 			ksort( $raw_data );
 		}
 
-		$settings = get_option( 'vayz_settings', array() );
+		$settings = get_option( 'sync_settings', array() );
 		$local_key = isset( $settings['key'] ) ? $settings['key'] : '';
 
 		// Try keys in order: local key (if set), then provided $key
 		$candidate_keys = array_values( array_unique( array_filter( array( $local_key, $key ) ) ) );
 		$valid = false;
 		foreach ( $candidate_keys as $candidate_key ) {
-			if ( VAYZ_Security::verify_signature( $raw_data, $candidate_key, $signature ) ) {
+			if ( SYNC_Security::verify_signature( $raw_data, $candidate_key, $signature ) ) {
 				$valid = true;
 				break;
 			}
@@ -325,6 +328,30 @@ class VAYZ_Ajax {
 	}
 
 	/**
+	 * Authenticate request via WP nonce (local admin) or HMAC signature (remote).
+	 *
+	 * @param string $key_field POST field containing the connection key.
+	 * @return bool True when authenticated; sends error response and returns false otherwise.
+	 */
+	private function authenticate_request( $key_field = 'key' ) {
+		$this->maybe_send_cors_headers();
+
+		$key = isset( $_POST[ $key_field ] ) ? sanitize_text_field( $_POST[ $key_field ] ) : '';
+
+		if ( ! empty( $_POST['nonce'] ) && check_ajax_referer( 'sync_nonce', 'nonce', false ) ) {
+			return true;
+		}
+
+		$verify = $this->verify_request( $key );
+		if ( is_wp_error( $verify ) ) {
+			$this->send_error( $verify->get_error_message(), $verify->get_error_code(), 403 );
+			return false;
+		}
+
+		return true;
+	}
+
+	/**
 	 * Send error response
 	 *
 	 * @param string $message Error message
@@ -343,7 +370,7 @@ class VAYZ_Ajax {
 	 * Verify connection to remote site
 	 */
 	public function ajax_verify_connection() {
-		check_ajax_referer( 'vayz_nonce', 'nonce' );
+		check_ajax_referer( 'sync_nonce', 'nonce' );
 		$this->maybe_send_cors_headers();
 
 		$remote_key = isset( $_POST['key'] ) ? sanitize_text_field( $_POST['key'] ) : '';
@@ -355,7 +382,7 @@ class VAYZ_Ajax {
 		}
 
 		// Verify signature using local key (this is a local AJAX request)
-		$settings = get_option( 'vayz_settings', array() );
+		$settings = get_option( 'sync_settings', array() );
 		$local_key = isset( $settings['key'] ) ? $settings['key'] : '';
 
 		if ( empty( $_POST['sig'] ) ) {
@@ -368,7 +395,7 @@ class VAYZ_Ajax {
 		unset( $data['nonce'] );
 		unset( $data['sig'] );
 
-		if ( ! VAYZ_Security::verify_signature( $data, $local_key, $signature ) ) {
+		if ( ! SYNC_Security::verify_signature( $data, $local_key, $signature ) ) {
 			$this->send_error( 'Invalid signature', 'invalid_signature' );
 			return;
 		}
@@ -413,33 +440,15 @@ class VAYZ_Ajax {
 	 * Initiate migration
 	 */
 	public function ajax_initiate_migration() {
-		check_ajax_referer( 'vayz_nonce', 'nonce' );
-		$this->maybe_send_cors_headers();
+		if ( ! $this->authenticate_request() ) {
+			return;
+		}
 
 		$remote_key = isset( $_POST['key'] ) ? sanitize_text_field( $_POST['key'] ) : '';
 		$action = isset( $_POST['action_type'] ) ? sanitize_text_field( $_POST['action_type'] ) : ''; // 'push' or 'pull'
 
 		if ( empty( $remote_key ) || empty( $action ) ) {
 			$this->send_error( 'Missing parameters', 'missing_params' );
-			return;
-		}
-
-		// Verify signature using local key (this is a local AJAX request)
-		$settings = get_option( 'vayz_settings', array() );
-		$local_key = isset( $settings['key'] ) ? $settings['key'] : '';
-
-		if ( empty( $_POST['sig'] ) ) {
-			$this->send_error( 'Missing signature', 'missing_signature' );
-			return;
-		}
-
-		$signature = sanitize_text_field( $_POST['sig'] );
-		$data = $_POST;
-		unset( $data['nonce'] );
-		unset( $data['sig'] );
-
-		if ( ! VAYZ_Security::verify_signature( $data, $local_key, $signature ) ) {
-			$this->send_error( 'Invalid signature', 'invalid_signature' );
 			return;
 		}
 
@@ -482,16 +491,20 @@ class VAYZ_Ajax {
 			return;
 		}
 
+		@ini_set( 'memory_limit', '512M' );
+		@set_time_limit( 300 );
+
 		// Get table info for dynamic chunk sizing
 		$table_info = $this->core->get_table_info( $table );
 		$total_rows = $table_info['row_count'];
 		$chunk_size = $table_info['chunk_size'];
 
-		// Export table chunk
-		$sql = $this->core->export_table( $table, $offset, $chunk_size );
-
-		$rows_exported = min( $chunk_size, $total_rows - $offset );
-		$has_more = ( $offset + $rows_exported ) < $total_rows;
+		// Export table chunk (byte-limited for wide rows like wp_options)
+		$export     = $this->core->export_table_bounded( $table, $offset, $chunk_size );
+		$sql        = $export['sql'];
+		$chunk_size = $export['chunk_size'];
+		$rows_exported = $export['rows_exported'];
+		$has_more   = ( $offset + $rows_exported ) < $total_rows;
 
 		$this->send_response( array(
 			'success' => true,
@@ -501,22 +514,148 @@ class VAYZ_Ajax {
 			'total_rows' => $total_rows,
 			'has_more' => $has_more,
 			'chunk_size' => $chunk_size,
+			'sql_bytes' => $export['sql_bytes'],
 		) );
+	}
+
+	/**
+	 * Verify HMAC signature from raw POST body (matches browser URLSearchParams signing).
+	 *
+	 * @param string $key Secret key.
+	 * @return true|WP_Error
+	 */
+	private function verify_raw_body_signature( $key ) {
+		if ( empty( $_POST['sig'] ) ) {
+			return new WP_Error( 'missing_signature', 'Missing signature' );
+		}
+
+		$signature = sanitize_text_field( wp_unslash( $_POST['sig'] ) );
+		$raw_post  = file_get_contents( 'php://input' );
+
+		if ( '' !== $raw_post ) {
+			$query_parts    = explode( '&', $raw_post );
+			$filtered_parts = array();
+			foreach ( $query_parts as $part ) {
+				if ( strpos( $part, 'sig=' ) !== 0 && strpos( $part, 'nonce=' ) !== 0 ) {
+					$filtered_parts[] = $part;
+				}
+			}
+			sort( $filtered_parts );
+			$verify_query_string = implode( '&', $filtered_parts );
+		} else {
+			$sig_data = wp_unslash( $_POST );
+			unset( $sig_data['sig'], $sig_data['nonce'] );
+			ksort( $sig_data );
+			$verify_query_string = http_build_query( $sig_data, '', '&', PHP_QUERY_RFC3986 );
+		}
+
+		$expected_sig = hash_hmac( 'sha256', $verify_query_string, $key );
+		if ( hash_equals( $expected_sig, $signature ) ) {
+			return true;
+		}
+
+		return new WP_Error( 'invalid_signature', 'Invalid signature' );
+	}
+
+	/**
+	 * Extract SQL from import payload (plain or base64).
+	 *
+	 * @param array $data Parsed POST data.
+	 * @return string|WP_Error
+	 */
+	private function extract_import_sql( $data ) {
+		if ( ! empty( $data['sql_b64'] ) ) {
+			$sql = base64_decode( $data['sql_b64'], true );
+			if ( false === $sql ) {
+				return new WP_Error( 'invalid_sql', 'Invalid base64 SQL payload' );
+			}
+			return $sql;
+		}
+
+		if ( isset( $data['sql'] ) ) {
+			return $data['sql'];
+		}
+
+		return new WP_Error( 'missing_sql', 'Missing SQL payload' );
+	}
+
+	/**
+	 * Proxy push import to remote site (server-to-server).
+	 */
+	public function ajax_remote_import_chunk() {
+		if ( ! check_ajax_referer( 'sync_nonce', 'nonce', false ) ) {
+			$this->send_error( 'Invalid nonce', 'invalid_nonce', 403 );
+			return;
+		}
+
+		@ini_set( 'memory_limit', '512M' );
+		@set_time_limit( 600 );
+
+		$this->maybe_send_cors_headers();
+
+		$raw_post = file_get_contents( 'php://input' );
+		parse_str( $raw_post, $raw_data );
+		if ( empty( $raw_data ) ) {
+			$raw_data = wp_unslash( $_POST );
+		}
+
+		$settings  = get_option( 'sync_settings', array() );
+		$local_key = isset( $settings['key'] ) ? $settings['key'] : '';
+
+		$verify = $this->verify_raw_body_signature( $local_key );
+		if ( is_wp_error( $verify ) ) {
+			$this->send_error( $verify->get_error_message(), $verify->get_error_code(), 403 );
+			return;
+		}
+
+		$remote_url = isset( $raw_data['remote_url'] ) ? esc_url_raw( $raw_data['remote_url'] ) : '';
+		$remote_key = isset( $raw_data['key'] ) ? sanitize_text_field( $raw_data['key'] ) : '';
+		$sql        = isset( $raw_data['sql'] ) ? $raw_data['sql'] : '';
+
+		if ( empty( $remote_url ) || empty( $remote_key ) || '' === $sql ) {
+			$this->send_error( 'Missing parameters', 'missing_params' );
+			return;
+		}
+
+		$remote_url = rtrim( $remote_url, '/' );
+		$ajax_url   = $remote_url . '/wp-admin/admin-ajax.php';
+
+		$payload = array(
+			'action'        => 'sync_import_chunk',
+			'key'           => $remote_key,
+			'sql_b64'       => base64_encode( $sql ),
+			'old_url'       => isset( $raw_data['old_url'] ) ? esc_url_raw( $raw_data['old_url'] ) : '',
+			'new_url'       => isset( $raw_data['new_url'] ) ? esc_url_raw( $raw_data['new_url'] ) : '',
+			'old_path'      => isset( $raw_data['old_path'] ) ? sanitize_text_field( $raw_data['old_path'] ) : '',
+			'new_path'      => isset( $raw_data['new_path'] ) ? sanitize_text_field( $raw_data['new_path'] ) : '',
+			'source_prefix' => isset( $raw_data['source_prefix'] ) ? sanitize_text_field( $raw_data['source_prefix'] ) : '',
+		);
+
+		$result = $this->remote_post( $ajax_url, $payload, $remote_key );
+
+		if ( is_wp_error( $result ) ) {
+			$this->send_error( $result->get_error_message(), $result->get_error_code() );
+			return;
+		}
+
+		if ( empty( $result['success'] ) ) {
+			$message = isset( $result['error'] ) ? $result['error'] : 'Remote import failed';
+			$code    = isset( $result['code'] ) ? $result['code'] : 'import_failed';
+			$this->send_error( $message, $code );
+			return;
+		}
+
+		$this->send_response( $result );
 	}
 
 	/**
 	 * Import database chunk
 	 */
 	public function ajax_import_chunk() {
-		check_ajax_referer( 'vayz_nonce', 'nonce' );
 		$this->maybe_send_cors_headers();
 
-		// Verify signature FIRST, before any data processing
-		$settings = get_option( 'vayz_settings', array() );
-		$local_key = isset( $settings['key'] ) ? $settings['key'] : '';
-
 		if ( empty( $_POST['sig'] ) ) {
-			$this->send_error( 'Missing signature', 'missing_signature' );
+			$this->send_error( 'Missing signature', 'missing_signature', 403 );
 			return;
 		}
 
@@ -527,34 +666,53 @@ class VAYZ_Ajax {
 		$raw_data = array();
 		parse_str( $raw_post, $raw_data );
 
-		// Remove sig and nonce from the raw query string directly (without parsing/re-encoding)
-		// This preserves the exact encoding that JavaScript sent
-		$query_parts = explode( '&', $raw_post );
-		$filtered_parts = array();
-		foreach ( $query_parts as $part ) {
-			if ( strpos( $part, 'sig=' ) !== 0 && strpos( $part, 'nonce=' ) !== 0 ) {
-				$filtered_parts[] = $part;
+		$remote_key = isset( $raw_data['key'] ) ? sanitize_text_field( $raw_data['key'] ) : '';
+
+		$signature_valid = false;
+		if ( ! empty( $_POST['nonce'] ) && check_ajax_referer( 'sync_nonce', 'nonce', false ) ) {
+			$signature_valid = true;
+		} else {
+			$verify = $this->verify_request( $remote_key );
+			if ( ! is_wp_error( $verify ) ) {
+				$signature_valid = true;
+			} else {
+				// Fallback: raw query-string HMAC (browser URLSearchParams)
+				$query_parts = explode( '&', $raw_post );
+				$filtered_parts = array();
+				foreach ( $query_parts as $part ) {
+					if ( strpos( $part, 'sig=' ) !== 0 && strpos( $part, 'nonce=' ) !== 0 ) {
+						$filtered_parts[] = $part;
+					}
+				}
+				sort( $filtered_parts );
+				$verify_query_string = implode( '&', $filtered_parts );
+
+				$settings       = get_option( 'sync_settings', array() );
+				$local_key      = isset( $settings['key'] ) ? $settings['key'] : '';
+				$candidate_keys = array_values( array_unique( array_filter( array( $local_key, $remote_key ) ) ) );
+
+				foreach ( $candidate_keys as $candidate_key ) {
+					$expected_sig = hash_hmac( 'sha256', $verify_query_string, $candidate_key );
+					if ( hash_equals( $expected_sig, $signature ) ) {
+						$signature_valid = true;
+						break;
+					}
+				}
 			}
 		}
-		// Sort the parts to match JavaScript's sorted keys
-		sort( $filtered_parts );
-		$verify_query_string = implode( '&', $filtered_parts );
 
-		// Create expected signature from the raw query string
-		$expected_sig = hash_hmac( 'sha256', $verify_query_string, $local_key );
-
-		if ( ! hash_equals( $expected_sig, $signature ) ) {
-			$this->send_error( 'Invalid signature', 'invalid_signature' );
+		if ( ! $signature_valid ) {
+			$this->send_error( 'Invalid signature', 'invalid_signature', 403 );
 			return;
 		}
 
 		// Now process the data after verification
 		$remote_key = isset( $raw_data['key'] ) ? sanitize_text_field( $raw_data['key'] ) : '';
-		// IMPORTANT: Do not stripslashes()/wp_unslash() the SQL payload.
-		// Those will remove backslashes that are part of SQL escaping (e.g. \' \\n),
-		// which can corrupt the statement and make subsequent INSERTs appear "combined".
-		// Parsing the raw body bypasses WordPress's wp_magic_quotes() slashing of $_POST.
-		$sql = isset( $raw_data['sql'] ) ? $raw_data['sql'] : '';
+		$sql        = $this->extract_import_sql( $raw_data );
+		if ( is_wp_error( $sql ) ) {
+			$this->send_error( $sql->get_error_message(), $sql->get_error_code() );
+			return;
+		}
 
 		$old_url = isset( $raw_data['old_url'] ) ? esc_url_raw( $raw_data['old_url'] ) : '';
 		$new_url = isset( $raw_data['new_url'] ) ? esc_url_raw( $raw_data['new_url'] ) : '';
@@ -562,10 +720,12 @@ class VAYZ_Ajax {
 		$new_path = isset( $raw_data['new_path'] ) ? sanitize_text_field( $raw_data['new_path'] ) : '';
 		$source_prefix = isset( $raw_data['source_prefix'] ) ? sanitize_text_field( $raw_data['source_prefix'] ) : null;
 
-		if ( empty( $remote_key ) || empty( $sql ) ) {
+		if ( empty( $remote_key ) || '' === $sql ) {
 			$this->send_error( 'Missing parameters', 'missing_params' );
 			return;
 		}
+
+		@set_time_limit( 300 );
 
 		// Replace URLs and paths if provided
 		if ( ! empty( $old_url ) && ! empty( $new_url ) ) {
@@ -605,32 +765,14 @@ class VAYZ_Ajax {
 	 * Finalize migration
 	 */
 	public function ajax_finalize_migration() {
-		check_ajax_referer( 'vayz_nonce', 'nonce' );
-		$this->maybe_send_cors_headers();
+		if ( ! $this->authenticate_request() ) {
+			return;
+		}
 
 		$remote_key = isset( $_POST['key'] ) ? sanitize_text_field( $_POST['key'] ) : '';
 
 		if ( empty( $remote_key ) ) {
 			$this->send_error( 'Missing key', 'missing_key' );
-			return;
-		}
-
-		// Verify signature using local key (this is a local AJAX request)
-		$settings = get_option( 'vayz_settings', array() );
-		$local_key = isset( $settings['key'] ) ? $settings['key'] : '';
-
-		if ( empty( $_POST['sig'] ) ) {
-			$this->send_error( 'Missing signature', 'missing_signature' );
-			return;
-		}
-
-		$signature = sanitize_text_field( $_POST['sig'] );
-		$data = $_POST;
-		unset( $data['nonce'] );
-		unset( $data['sig'] );
-
-		if ( ! VAYZ_Security::verify_signature( $data, $local_key, $signature ) ) {
-			$this->send_error( 'Invalid signature', 'invalid_signature' );
 			return;
 		}
 
@@ -659,13 +801,13 @@ class VAYZ_Ajax {
 	public function remote_post( $url, $data, $key ) {
 		// Add signature (remove existing sig first)
 		unset( $data['sig'] );
-		$data['sig'] = VAYZ_Security::create_signature( $data, $key );
+		$data['sig'] = SYNC_Security::create_signature( $data, $key );
 
 		// Make request
 		$response = wp_remote_post( $url, array(
-			'timeout' => 300,
+			'timeout' => 600,
 			'body' => $data,
-			'sslverify' => ! VAYZ_Security::is_localhost( $url ),
+			'sslverify' => ! SYNC_Security::is_localhost( $url ),
 		) );
 
 		if ( is_wp_error( $response ) ) {

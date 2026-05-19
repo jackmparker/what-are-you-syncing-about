@@ -10,7 +10,7 @@
  * INSTALL:
  *   Upload to the WordPress root (same folder as wp-load.php), then visit the script using
  *   the hostname that **DNS actually resolves** (the real server), e.g.:
- *   https://dev.carterparkdental.com/vayz-emergency-url-fix.php?key=YOUR_SECRET
+ *   https://dev.carterparkdental.com/sync-emergency-url-fix.php?key=YOUR_SECRET
  *
  *   Do NOT use the broken URL in the browser (e.g. dev.dev....) — that host often has no DNS
  *   record (NXDOMAIN), so the request never reaches your server.
@@ -28,7 +28,7 @@
  *
  * SECURITY: Delete this file from the server immediately after success.
  *
- * @package VAYZ
+ * @package SYNC
  */
 
 $secret      = 'dnifsdonifds8hfds8fdshoiufdsnof43nri93niofdniofdsniofdsghgfjhgjhg';

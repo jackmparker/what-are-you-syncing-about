@@ -2,37 +2,37 @@
  * WP Sync DB Simple Admin Styles
  */
 
-.vayz-wrap {
+.sync-wrap {
 	max-width: 1200px;
 	margin: 20px 0;
 }
 
-.vayz-container {
+.sync-container {
 	background: #fff;
 	border: 1px solid #ccd0d4;
 	box-shadow: 0 1px 1px rgba(0, 0, 0, 0.04);
 	padding: 20px;
 }
 
-.vayz-section {
+.sync-section {
 	margin-bottom: 30px;
 	padding-bottom: 30px;
 	border-bottom: 1px solid #eee;
 }
 
-.vayz-section:last-child {
+.sync-section:last-child {
 	border-bottom: none;
 	margin-bottom: 0;
 	padding-bottom: 0;
 }
 
-.vayz-section h2 {
+.sync-section h2 {
 	margin-top: 0;
 	font-size: 18px;
 	font-weight: 600;
 }
 
-.vayz-section .description {
+.sync-section .description {
 	color: #646970;
 	font-size: 13px;
 	margin-bottom: 15px;
@@ -109,6 +109,59 @@
 .migration-actions .button:disabled {
 	opacity: 0.5;
 	cursor: not-allowed;
+}
+
+/* Activity Log */
+.sync-log-panel {
+	margin-top: 24px;
+	border: 1px solid #c3c4c7;
+	border-radius: 4px;
+	background: #fff;
+}
+
+.sync-log-header {
+	display: flex;
+	align-items: center;
+	justify-content: space-between;
+	padding: 10px 12px;
+	border-bottom: 1px solid #c3c4c7;
+	background: #f6f7f7;
+}
+
+.sync-log-header h3 {
+	margin: 0;
+	font-size: 13px;
+	font-weight: 600;
+}
+
+.sync-log-output {
+	margin: 0;
+	padding: 12px;
+	max-height: 320px;
+	overflow-y: auto;
+	font-family: Consolas, Monaco, monospace;
+	font-size: 12px;
+	line-height: 1.5;
+	white-space: pre-wrap;
+	word-break: break-word;
+	background: #1d2327;
+	color: #c3c4c7;
+}
+
+.sync-log-output .log-info {
+	color: #72aee6;
+}
+
+.sync-log-output .log-success {
+	color: #68de7c;
+}
+
+.sync-log-output .log-warn {
+	color: #f0c33c;
+}
+
+.sync-log-output .log-error {
+	color: #f86368;
 }
 
 /* Progress Section */
@@ -196,14 +249,14 @@
 }
 
 /* Hide any empty WordPress admin notices on our page */
-.vayz-wrap ~ .notice p:empty,
-.vayz-wrap ~ .notice:has(p:empty),
-.vayz-wrap .notice p:empty {
+.sync-wrap ~ .notice p:empty,
+.sync-wrap ~ .notice:has(p:empty),
+.sync-wrap .notice p:empty {
 	display: none;
 }
 
-.vayz-wrap ~ .notice:has(p:empty),
-.vayz-wrap .notice:has(p:empty) {
+.sync-wrap ~ .notice:has(p:empty),
+.sync-wrap .notice:has(p:empty) {
 	display: none !important;
 }
 

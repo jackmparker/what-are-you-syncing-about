@@ -9,7 +9,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-class VAYZ_Security {
+class SYNC_Security {
 
 	/**
 	 * Generate a random 32-character key
