@@ -1,19 +1,19 @@
 /**
- * WP Sync DB Simple Admin JavaScript
+ * What are you syncing about? Admin JavaScript
  */
 
 (function() {
 	'use strict';
 
-	const wpsdb = window.syncSimple || {};
-	const ajaxUrl = wpsdb.ajaxUrl || '/wp-admin/admin-ajax.php';
-	const nonce = wpsdb.nonce || '';
-	const connectionKey = wpsdb.connectionKey || '';
-	const siteInfo = wpsdb.siteInfo || {};
-	const i18n = wpsdb.i18n || {};
+	const syncData = window.syncSimple || {};
+	const ajaxUrl = syncData.ajaxUrl || '/wp-admin/admin-ajax.php';
+	const nonce = syncData.nonce || '';
+	const connectionKey = syncData.connectionKey || '';
+	const siteInfo = syncData.siteInfo || {};
+	const i18n = syncData.i18n || {};
 
 	// How many tables to process simultaneously (saved in Advanced Settings)
-	const CONCURRENCY = Math.max( 1, Math.min( 10, parseInt( wpsdb.concurrency || '3', 10 ) ) );
+	const CONCURRENCY = Math.max( 1, Math.min( 10, parseInt( syncData.concurrency || '3', 10 ) ) );
 	// Tables with fewer than this many bytes are batched together
 	const SMALL_TABLE_THRESHOLD = 4096;
 	// Max tables per batch request
@@ -427,14 +427,17 @@
 			return;
 		}
 
-		const syncPluginsEl = document.getElementById('sync-plugins');
-		const syncUploadsEl = document.getElementById('sync-uploads');
-		const doSyncPlugins = syncPluginsEl && syncPluginsEl.checked;
-		const doSyncUploads = syncUploadsEl && syncUploadsEl.checked;
+		const syncDatabaseEl = document.getElementById('sync-database');
+		const syncUploadsEl  = document.getElementById('sync-uploads');
+		const doSyncDatabase = syncDatabaseEl ? syncDatabaseEl.checked : false;
+		const doSyncUploads  = syncUploadsEl && syncUploadsEl.checked;
 
-		log('Starting ' + type + ' migration → ' + remoteUrl, 'info');
-		if (doSyncPlugins) log('Plugins sync: enabled', 'info');
-		if (doSyncUploads) log('Uploads sync: enabled', 'info');
+		if (!doSyncDatabase && !doSyncUploads) {
+			showError('Select at least one option to sync.');
+			return;
+		}
+
+		log('Starting ' + type + ' — db=' + doSyncDatabase + ' uploads=' + doSyncUploads + ' → ' + remoteUrl, 'info');
 
 		migrationInProgress = true;
 		hideError();
@@ -447,15 +450,19 @@
 		verifyConnectionBtn.disabled = true;
 
 		try {
-			if (type === 'pull') {
-				await pullDatabase();
-			} else {
-				await pushDatabase();
+			if (doSyncDatabase) {
+				if (type === 'pull') {
+					await pullDatabase();
+				} else {
+					await pushDatabase();
+				}
 			}
 
-			if (doSyncPlugins || doSyncUploads) {
+			if (doSyncUploads) {
 				hideSuccess();
-				await syncFiles(type, doSyncPlugins, doSyncUploads);
+				await syncFiles(type);
+			} else if (doSyncDatabase) {
+				// DB-only: success already shown by pullDatabase/pushDatabase
 			}
 		} catch (error) {
 			log('Migration failed: ' + (error.message || 'unknown error'), 'error');
@@ -857,6 +864,37 @@
 	}
 
 	/**
+	 * Push file chunk via local PHP proxy (server-to-server, 600s timeout).
+	 * Used for sync_import_zip_chunk, sync_import_upload_chunk, sync_finalize_plugins on push.
+	 * Payload fields: remote_url, remote_action, key, and any of: zip_id, data, relative_path, is_last.
+	 */
+	async function proxyRemoteFileChunk(payload) {
+		const data = {
+			action: 'sync_remote_file_chunk',
+			remote_url: payload.remote_url,
+			remote_action: payload.remote_action,
+			key: payload.key
+		};
+
+		if (payload.zip_id)                      data.zip_id        = payload.zip_id;
+		if (payload.data)                        data.data          = payload.data;
+		if (payload.relative_path)               data.relative_path = payload.relative_path;
+		if (payload.is_last)                     data.is_last       = payload.is_last;
+		if (payload.compressed)                  data.compressed    = payload.compressed;
+		if (payload.chunk_offset != null)        data.chunk_offset  = payload.chunk_offset;
+
+		const sig = await createSignature(data, connectionKey);
+		data.nonce = nonce;
+		data.sig   = sig;
+
+		const json = await localPost(data);
+		if (!json.success) {
+			logObject('Proxy file chunk response', json, 'error');
+		}
+		return json;
+	}
+
+	/**
 	 * Make a signed request to a remote site's admin-ajax.php.
 	 */
 	async function remoteRequest(url, data, key) {
@@ -901,149 +939,19 @@
 
 	// ── File sync orchestration ───────────────────────────────────────────────
 
-	async function syncFiles(type, syncPlugins, syncUploads) {
+	async function syncFiles(type) {
 		const remoteAjaxUrl = remoteUrl + '/wp-admin/admin-ajax.php';
 
-		if (syncPlugins) {
-			log('File sync: plugins phase (' + type + ')', 'info');
-			showProgress(0, 'Syncing plugins...');
-			if (type === 'pull') {
-				await pullPlugins(remoteAjaxUrl);
-			} else {
-				await pushPlugins(remoteAjaxUrl);
-			}
+		log('File sync: uploads phase (' + type + ')', 'info');
+		showProgress(0, 'Scanning uploads...');
+		if (type === 'pull') {
+			await pullUploads(remoteAjaxUrl);
+		} else {
+			await pushUploads(remoteAjaxUrl);
 		}
 
-		if (syncUploads) {
-			log('File sync: uploads phase (' + type + ')', 'info');
-			showProgress(0, 'Scanning uploads...');
-			if (type === 'pull') {
-				await pullUploads(remoteAjaxUrl);
-			} else {
-				await pushUploads(remoteAjaxUrl);
-			}
-		}
-
-		showProgress(100, 'File sync complete!');
-		showSuccess('Migration and file sync completed successfully!');
-	}
-
-	// ── Plugins sync ──────────────────────────────────────────────────────────
-
-	/**
-	 * Pull: remote creates ZIP, browser fetches chunks → imports locally → finalize locally.
-	 */
-	async function pullPlugins(remoteAjaxUrl) {
-		let zipId = null;
-		let offset = 0;
-		let done = false;
-		let totalSize = 0;
-
-		log('Plugins pull: creating ZIP on remote', 'info');
-
-		while (!done) {
-			const payload = { action: 'sync_export_zip_chunk', key: remoteKey, offset: offset };
-			if (zipId) payload.zip_id = zipId;
-
-			const exportResult = await withRetry(function() { return remoteRequest(remoteAjaxUrl, payload, remoteKey); });
-			if (!exportResult.success) {
-				throw new Error(exportResult.error || 'Plugin ZIP export failed');
-			}
-
-			zipId      = exportResult.zip_id;
-			totalSize  = exportResult.total_size || totalSize;
-			done       = exportResult.done;
-			const nextOffset = exportResult.next_offset;
-
-			const importReq = { action: 'sync_import_zip_chunk', zip_id: zipId, data: exportResult.data };
-			const importSig = await createSignature(importReq, connectionKey);
-			importReq.nonce = nonce;
-			importReq.sig   = importSig;
-
-			const importResult = await withRetry(function() { return localPost(importReq); });
-			if (!importResult.success) {
-				throw new Error(importResult.error || 'Plugin ZIP import failed');
-			}
-
-			if (totalSize > 0) {
-				showProgress(Math.round((nextOffset / totalSize) * 90), 'Syncing plugins (' + formatBytes(nextOffset) + ' / ' + formatBytes(totalSize) + ')...');
-			}
-			offset = nextOffset;
-		}
-
-		log('Plugins pull: finalizing locally', 'info');
-		const finalizeReq = { action: 'sync_finalize_plugins', zip_id: zipId };
-		const finalizeSig = await createSignature(finalizeReq, connectionKey);
-		finalizeReq.nonce = nonce;
-		finalizeReq.sig   = finalizeSig;
-
-		const finalizeResult = await localPost(finalizeReq);
-		if (!finalizeResult.success) {
-			throw new Error(finalizeResult.error || 'Plugin finalization failed');
-		}
-
-		log('Plugins pull complete', 'success');
-		showProgress(100, 'Plugins synced!');
-	}
-
-	/**
-	 * Push: local creates ZIP, browser fetches chunks → imports on remote → finalize remote.
-	 */
-	async function pushPlugins(remoteAjaxUrl) {
-		let zipId = null;
-		let offset = 0;
-		let done = false;
-		let totalSize = 0;
-
-		log('Plugins push: creating ZIP locally', 'info');
-
-		while (!done) {
-			const exportReq = { action: 'sync_export_zip_chunk', key: remoteKey, offset: offset };
-			if (zipId) exportReq.zip_id = zipId;
-			const exportSig = await createSignature(exportReq, connectionKey);
-			exportReq.nonce = nonce;
-			exportReq.sig   = exportSig;
-
-			const exportResult = await withRetry(function() { return localPost(exportReq); });
-			if (!exportResult.success) {
-				throw new Error(exportResult.error || 'Plugin ZIP export failed');
-			}
-
-			zipId     = exportResult.zip_id;
-			totalSize = exportResult.total_size || totalSize;
-			done      = exportResult.done;
-			const nextOffset = exportResult.next_offset;
-
-			const importResult = await withRetry(function() {
-				return remoteRequest(remoteAjaxUrl, {
-					action: 'sync_import_zip_chunk',
-					key: remoteKey,
-					zip_id: zipId,
-					data: exportResult.data
-				}, remoteKey);
-			});
-			if (!importResult.success) {
-				throw new Error(importResult.error || 'Plugin ZIP import failed');
-			}
-
-			if (totalSize > 0) {
-				showProgress(Math.round((nextOffset / totalSize) * 90), 'Syncing plugins (' + formatBytes(nextOffset) + ' / ' + formatBytes(totalSize) + ')...');
-			}
-			offset = nextOffset;
-		}
-
-		log('Plugins push: finalizing on remote', 'info');
-		const finalizeResult = await remoteRequest(remoteAjaxUrl, {
-			action: 'sync_finalize_plugins',
-			key: remoteKey,
-			zip_id: zipId
-		}, remoteKey);
-		if (!finalizeResult.success) {
-			throw new Error(finalizeResult.error || 'Plugin finalization failed');
-		}
-
-		log('Plugins push complete', 'success');
-		showProgress(100, 'Plugins synced!');
+		showProgress(100, 'Sync complete!');
+		showSuccess('Sync completed successfully!');
 	}
 
 	// ── Uploads sync ──────────────────────────────────────────────────────────
@@ -1069,28 +977,27 @@
 		return toTransfer;
 	}
 
-	async function getLocalInventory(dirType) {
-		const req = { action: 'sync_get_file_inventory', key: remoteKey, dir_type: dirType };
+	async function getLocalInventory() {
+		const req = { action: 'sync_get_file_inventory', key: remoteKey };
 		const sig = await createSignature(req, connectionKey);
 		req.nonce = nonce;
 		req.sig   = sig;
 		const result = await withRetry(function() { return localPost(req); });
 		if (!result.success) {
-			throw new Error(result.error || 'Failed to get local ' + dirType + ' inventory');
+			throw new Error(result.error || 'Failed to get local uploads inventory');
 		}
 		return result.inventory || {};
 	}
 
-	async function getRemoteInventory(remoteAjaxUrl, dirType) {
+	async function getRemoteInventory(remoteAjaxUrl) {
 		const result = await withRetry(function() {
 			return remoteRequest(remoteAjaxUrl, {
 				action: 'sync_get_file_inventory',
-				key: remoteKey,
-				dir_type: dirType
+				key: remoteKey
 			}, remoteKey);
 		});
 		if (!result.success) {
-			throw new Error(result.error || 'Failed to get remote ' + dirType + ' inventory');
+			throw new Error(result.error || 'Failed to get remote uploads inventory');
 		}
 		return result.inventory || {};
 	}
@@ -1101,7 +1008,7 @@
 			return sum + (info && info.size ? info.size : 0);
 		}, 0);
 
-		log('Uploads: ' + files.length + ' files to transfer (' + formatBytes(totalBytes) + ')', 'info');
+		log('Uploads: ' + files.length + ' files to transfer (' + formatBytes(totalBytes) + ') concurrency=' + CONCURRENCY, 'info');
 
 		if (files.length === 0) {
 			showProgress(100, 'Uploads up to date, nothing to transfer.');
@@ -1109,44 +1016,54 @@
 		}
 
 		let bytesTransferred = 0;
+		const queue = files.slice();
 
-		for (const relativePath of files) {
-			let offset = 0;
-			let done = false;
+		const workers = Array.from({ length: Math.min(CONCURRENCY, files.length) }, async function() {
+			while (queue.length) {
+				const relativePath = queue.shift();
+				let offset = 0;
+				let done = false;
 
-			while (!done) {
-				const exportResult = await withRetry(function() { return fetchChunk(relativePath, offset); });
-				if (!exportResult.success) {
-					throw new Error(exportResult.error || 'Upload export failed: ' + relativePath);
-				}
+				while (!done) {
+					const exportResult = await withRetry(function() { return fetchChunk(relativePath, offset); });
+					if (!exportResult.success) {
+						throw new Error(exportResult.error || 'Upload export failed: ' + relativePath);
+					}
 
-				done = exportResult.done;
+					done = exportResult.done;
 
-				const importResult = await withRetry(function() { return importChunk(relativePath, exportResult.data, done); });
-				if (!importResult.success) {
-					throw new Error(importResult.error || 'Upload import failed: ' + relativePath);
-				}
+					const compressed = exportResult.compressed || false;
+					const chunkOffset = exportResult.offset;
+					const importResult = await withRetry(function() {
+						return importChunk(relativePath, exportResult.data, done, compressed, chunkOffset);
+					});
+					if (!importResult.success) {
+						throw new Error(importResult.error || 'Upload import failed: ' + relativePath);
+					}
 
-				const chunkBytes = exportResult.next_offset - offset;
-				bytesTransferred += chunkBytes;
-				offset = exportResult.next_offset;
+					const chunkBytes = exportResult.next_offset - offset;
+					bytesTransferred += chunkBytes;
+					offset = exportResult.next_offset;
 
-				if (totalBytes > 0) {
-					showProgress(
-						10 + Math.round((bytesTransferred / totalBytes) * 85),
-						'Syncing uploads (' + formatBytes(bytesTransferred) + ' / ' + formatBytes(totalBytes) + ')...'
-					);
+					if (totalBytes > 0) {
+						showProgress(
+							10 + Math.round((bytesTransferred / totalBytes) * 85),
+							'Syncing uploads (' + formatBytes(bytesTransferred) + ' / ' + formatBytes(totalBytes) + ')...'
+						);
+					}
 				}
 			}
-		}
+		});
+
+		await Promise.all(workers);
 	}
 
 	async function pullUploads(remoteAjaxUrl) {
 		log('Uploads pull: getting inventories', 'info');
 		showProgress(5, 'Scanning uploads on both sites...');
 
-		const remoteInv = await getRemoteInventory(remoteAjaxUrl, 'uploads');
-		const localInv  = await getLocalInventory('uploads');
+		const remoteInv = await getRemoteInventory(remoteAjaxUrl);
+		const localInv  = await getLocalInventory();
 		const toTransfer = diffInventories(remoteInv, localInv);
 
 		if (toTransfer.length === 0) {
@@ -1166,13 +1083,15 @@
 					offset: offset
 				}, remoteKey);
 			},
-			async function(relativePath, data, isLast) {
+			async function(relativePath, data, isLast, compressed, chunkOffset) {
 				const req = {
 					action: 'sync_import_upload_chunk',
 					key: remoteKey,
 					relative_path: relativePath,
 					data: data,
-					is_last: isLast ? '1' : ''
+					is_last: isLast ? '1' : '',
+					compressed: compressed ? '1' : '',
+					chunk_offset: String(chunkOffset != null ? chunkOffset : -1)
 				};
 				const sig = await createSignature(req, connectionKey);
 				req.nonce = nonce;
@@ -1189,8 +1108,8 @@
 		log('Uploads push: getting inventories', 'info');
 		showProgress(5, 'Scanning uploads on both sites...');
 
-		const localInv  = await getLocalInventory('uploads');
-		const remoteInv = await getRemoteInventory(remoteAjaxUrl, 'uploads');
+		const localInv  = await getLocalInventory();
+		const remoteInv = await getRemoteInventory(remoteAjaxUrl);
 		const toTransfer = diffInventories(localInv, remoteInv);
 
 		if (toTransfer.length === 0) {
@@ -1214,14 +1133,17 @@
 				req.sig   = sig;
 				return localPost(req);
 			},
-			function(relativePath, data, isLast) {
-				return remoteRequest(remoteAjaxUrl, {
-					action: 'sync_import_upload_chunk',
+			function(relativePath, data, isLast, compressed, chunkOffset) {
+				return proxyRemoteFileChunk({
+					remote_url: remoteUrl,
+					remote_action: 'sync_import_upload_chunk',
 					key: remoteKey,
 					relative_path: relativePath,
 					data: data,
-					is_last: isLast ? '1' : ''
-				}, remoteKey);
+					is_last: isLast ? '1' : '',
+					compressed: compressed ? '1' : '',
+					chunk_offset: String(chunkOffset != null ? chunkOffset : -1)
+				});
 			}
 		);
 

@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 class SYNC_Files {
 
 	private static $instance = null;
-	const CHUNK_SIZE = 2097152; // 2 MB per chunk
+	const CHUNK_SIZE = 2097152; // 2 MB per chunk (base64 = ~2.7 MB on wire, safe for nginx defaults)
 
 	public static function get_instance() {
 		if ( null === self::$instance ) {
@@ -34,18 +34,13 @@ class SYNC_Files {
 		return $upload_dir['basedir'];
 	}
 
-	private function get_plugins_dir() {
-		return WP_PLUGIN_DIR;
-	}
-
 	/**
-	 * Recursively scan a directory and return a file inventory.
+	 * Recursively scan wp-content/uploads and return a file inventory.
 	 *
-	 * @param string $dir_type 'uploads' or 'plugins'
-	 * @return array [ 'relative/path' => [ 'hash' => md5, 'size' => bytes ] ]
+	 * @return array [ 'relative/path' => [ 'hash' => string, 'size' => bytes ] ]
 	 */
-	public function get_file_inventory( $dir_type ) {
-		$base_dir = ( 'plugins' === $dir_type ) ? $this->get_plugins_dir() : $this->get_uploads_dir();
+	public function get_file_inventory() {
+		$base_dir  = $this->get_uploads_dir();
 		$inventory = array();
 
 		if ( ! is_dir( $base_dir ) ) {
@@ -78,9 +73,14 @@ class SYNC_Files {
 					continue;
 				}
 
+				$size = $file->getSize();
+				$hash = ( $size <= 1048576 )
+					? md5_file( $path )
+					: $file->getMTime() . ':' . $size;
+
 				$inventory[ $relative ] = array(
-					'hash' => md5_file( $path ),
-					'size' => $file->getSize(),
+					'hash' => $hash,
+					'size' => $size,
 				);
 			}
 		} catch ( UnexpectedValueException $e ) {
@@ -111,197 +111,6 @@ class SYNC_Files {
 			}
 		}
 		return $to_transfer;
-	}
-
-	// ── Plugins ZIP ──────────────────────────────────────────────────────────────
-
-	/**
-	 * Create a ZIP of wp-content/plugins. Returns a zip_id string or WP_Error.
-	 *
-	 * @return string|WP_Error
-	 */
-	public function create_plugins_zip() {
-		if ( ! class_exists( 'ZipArchive' ) ) {
-			return new WP_Error( 'no_zip', 'ZipArchive PHP extension is not available.' );
-		}
-
-		$plugins_dir = $this->get_plugins_dir();
-		$temp_dir    = $this->get_temp_dir();
-
-		if ( ! file_exists( $temp_dir ) ) {
-			wp_mkdir_p( $temp_dir );
-		}
-
-		$zip_id   = 'pl-' . uniqid( '', true );
-		$zip_path = $temp_dir . '/' . $zip_id . '.zip';
-
-		$zip = new ZipArchive();
-		if ( true !== $zip->open( $zip_path, ZipArchive::CREATE | ZipArchive::OVERWRITE ) ) {
-			return new WP_Error( 'zip_create_failed', 'Failed to create plugins ZIP.' );
-		}
-
-		$real_plugins = realpath( $plugins_dir );
-		$base_len     = strlen( $real_plugins ) + 1;
-
-		try {
-			$iterator = new RecursiveIteratorIterator(
-				new RecursiveDirectoryIterator( $plugins_dir, RecursiveDirectoryIterator::SKIP_DOTS ),
-				RecursiveIteratorIterator::LEAVES_ONLY
-			);
-
-			foreach ( $iterator as $file ) {
-				if ( $file->isFile() ) {
-					$local_name = str_replace( DIRECTORY_SEPARATOR, '/', substr( $file->getRealPath(), $base_len ) );
-					$zip->addFile( $file->getRealPath(), $local_name );
-				}
-			}
-		} catch ( UnexpectedValueException $e ) {
-			$zip->close();
-			@unlink( $zip_path );
-			return new WP_Error( 'zip_scan_failed', 'Error scanning plugins directory: ' . $e->getMessage() );
-		}
-
-		$zip->close();
-		return $zip_id;
-	}
-
-	/**
-	 * Read a chunk of an export ZIP.
-	 *
-	 * @param string $zip_id
-	 * @param int    $offset
-	 * @return array|WP_Error
-	 */
-	public function export_zip_chunk( $zip_id, $offset ) {
-		if ( ! $this->is_valid_id( $zip_id ) ) {
-			return new WP_Error( 'invalid_id', 'Invalid ZIP ID.' );
-		}
-
-		$zip_path = $this->get_temp_dir() . '/' . $zip_id . '.zip';
-
-		if ( ! file_exists( $zip_path ) ) {
-			return new WP_Error( 'zip_not_found', 'ZIP file not found.' );
-		}
-
-		$total_size = filesize( $zip_path );
-		$fh         = fopen( $zip_path, 'rb' );
-		if ( ! $fh ) {
-			return new WP_Error( 'read_error', 'Cannot open ZIP for reading.' );
-		}
-
-		fseek( $fh, (int) $offset );
-		$data      = fread( $fh, self::CHUNK_SIZE );
-		fclose( $fh );
-
-		$next_offset = (int) $offset + strlen( $data );
-		$done        = ( $next_offset >= $total_size );
-
-		if ( $done ) {
-			@unlink( $zip_path );
-		}
-
-		return array(
-			'zip_id'      => $zip_id,
-			'data'        => base64_encode( $data ),
-			'offset'      => (int) $offset,
-			'next_offset' => $next_offset,
-			'total_size'  => $total_size,
-			'done'        => $done,
-		);
-	}
-
-	/**
-	 * Append a base64-decoded chunk to the incoming (import) ZIP.
-	 *
-	 * @param string $zip_id
-	 * @param string $data_b64 Base64-encoded binary chunk
-	 * @return true|WP_Error
-	 */
-	public function import_zip_chunk( $zip_id, $data_b64 ) {
-		if ( ! $this->is_valid_id( $zip_id ) ) {
-			return new WP_Error( 'invalid_id', 'Invalid ZIP ID.' );
-		}
-
-		$temp_dir = $this->get_temp_dir();
-		if ( ! file_exists( $temp_dir ) ) {
-			wp_mkdir_p( $temp_dir );
-		}
-
-		$data = base64_decode( $data_b64, true );
-		if ( false === $data ) {
-			return new WP_Error( 'invalid_data', 'Invalid base64 chunk.' );
-		}
-
-		$zip_path = $temp_dir . '/import-' . $zip_id . '.zip';
-		if ( false === file_put_contents( $zip_path, $data, FILE_APPEND ) ) {
-			return new WP_Error( 'write_failed', 'Failed to write ZIP chunk.' );
-		}
-
-		return true;
-	}
-
-	/**
-	 * Extract the assembled import ZIP into wp-content/plugins (non-destructive).
-	 * Never deletes plugins that exist on the target but not in the ZIP.
-	 *
-	 * @param string $zip_id
-	 * @return true|WP_Error
-	 */
-	public function finalize_plugins_zip( $zip_id ) {
-		if ( ! class_exists( 'ZipArchive' ) ) {
-			return new WP_Error( 'no_zip', 'ZipArchive PHP extension is not available.' );
-		}
-
-		if ( ! $this->is_valid_id( $zip_id ) ) {
-			return new WP_Error( 'invalid_id', 'Invalid ZIP ID.' );
-		}
-
-		$temp_dir    = $this->get_temp_dir();
-		$zip_path    = $temp_dir . '/import-' . $zip_id . '.zip';
-		$plugins_dir = $this->get_plugins_dir();
-
-		if ( ! file_exists( $zip_path ) ) {
-			return new WP_Error( 'zip_not_found', 'Assembled ZIP not found.' );
-		}
-
-		$zip = new ZipArchive();
-		if ( true !== $zip->open( $zip_path ) ) {
-			return new WP_Error( 'zip_open_failed', 'Failed to open ZIP for extraction.' );
-		}
-
-		$real_plugins = realpath( $plugins_dir );
-		$count        = $zip->numFiles;
-
-		for ( $i = 0; $i < $count; $i++ ) {
-			$entry_name = $zip->getNameIndex( $i );
-			if ( false === $entry_name || '/' === substr( $entry_name, -1 ) ) {
-				continue;
-			}
-
-			$target     = $plugins_dir . DIRECTORY_SEPARATOR . str_replace( '/', DIRECTORY_SEPARATOR, $entry_name );
-			$target_dir = dirname( $target );
-
-			if ( ! is_dir( $target_dir ) ) {
-				wp_mkdir_p( $target_dir );
-			}
-
-			$real_target_dir = realpath( $target_dir );
-			if ( false === $real_target_dir || 0 !== strpos( $real_target_dir, $real_plugins ) ) {
-				$zip->close();
-				@unlink( $zip_path );
-				return new WP_Error( 'path_traversal', 'ZIP contains unsafe path: ' . esc_html( $entry_name ) );
-			}
-
-			$content = $zip->getFromIndex( $i );
-			if ( false !== $content ) {
-				file_put_contents( $target, $content );
-			}
-		}
-
-		$zip->close();
-		@unlink( $zip_path );
-
-		return true;
 	}
 
 	// ── Upload file transfer ─────────────────────────────────────────────────────
@@ -338,8 +147,18 @@ class SYNC_Files {
 
 		$next_offset = (int) $offset + strlen( $data );
 
+		$compressed = false;
+		if ( function_exists( 'gzencode' ) && strlen( $data ) > 1024 ) {
+			$gz = gzencode( $data, 1 );
+			if ( false !== $gz && strlen( $gz ) < strlen( $data ) ) {
+				$data       = $gz;
+				$compressed = true;
+			}
+		}
+
 		return array(
 			'data'        => base64_encode( $data ),
+			'compressed'  => $compressed,
 			'offset'      => (int) $offset,
 			'next_offset' => $next_offset,
 			'file_size'   => $file_size,
@@ -355,7 +174,7 @@ class SYNC_Files {
 	 * @param bool   $is_last
 	 * @return true|WP_Error
 	 */
-	public function import_upload_chunk( $relative_path, $data_b64, $is_last ) {
+	public function import_upload_chunk( $relative_path, $data_b64, $is_last, $compressed = false, $chunk_offset = -1 ) {
 		$uploads_dir = $this->get_uploads_dir();
 
 		if ( ! $this->validate_relative_path( $relative_path, $uploads_dir ) ) {
@@ -366,17 +185,32 @@ class SYNC_Files {
 			return new WP_Error( 'blocked', 'PHP files cannot be written to the uploads directory.' );
 		}
 
-		$data = base64_decode( $data_b64, true );
-		if ( false === $data ) {
-			return new WP_Error( 'invalid_data', 'Invalid base64 chunk.' );
-		}
-
 		$temp_base = $this->get_temp_dir() . '/uploads';
 		$temp_path = $temp_base . DIRECTORY_SEPARATOR . str_replace( '/', DIRECTORY_SEPARATOR, $relative_path );
 		$temp_dir  = dirname( $temp_path );
 
 		if ( ! is_dir( $temp_dir ) ) {
 			wp_mkdir_p( $temp_dir );
+		}
+
+		// Idempotency: if temp file already contains this chunk (retry after timeout), skip the write.
+		if ( $chunk_offset >= 0 && file_exists( $temp_path ) && filesize( $temp_path ) > $chunk_offset ) {
+			if ( $is_last ) {
+				return $this->finalize_upload_file( $relative_path );
+			}
+			return true;
+		}
+
+		$data = base64_decode( $data_b64, true );
+		if ( false === $data ) {
+			return new WP_Error( 'invalid_data', 'Invalid base64 chunk.' );
+		}
+
+		if ( $compressed ) {
+			$dec = @gzdecode( $data );
+			if ( false !== $dec ) {
+				$data = $dec;
+			}
 		}
 
 		if ( false === file_put_contents( $temp_path, $data, FILE_APPEND ) ) {

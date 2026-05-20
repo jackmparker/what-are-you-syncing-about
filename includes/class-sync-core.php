@@ -12,7 +12,8 @@ if ( ! defined( 'ABSPATH' ) ) {
 class SYNC_Core {
 
 	private static $instance = null;
-	private $temp_prefix = '_sync_temp_';
+	private $temp_prefix    = '_sync_temp_';
+	private $backup_marker  = '_sync_bak_';
 	private $chunk_size = 1000; // Default rows per chunk (can be dynamically adjusted)
 	private $max_export_chunk_bytes = 524288; // 512KB max SQL per chunk (avoids timeouts / post limits)
 	private $finalize_guard_option = 'sync_finalize_guard';
@@ -148,9 +149,10 @@ class SYNC_Core {
 
 		$results = $wpdb->get_col( $query );
 
-		// Filter out temporary tables
+		// Filter out temp tables and backup tables left from previous migrations
 		foreach ( $results as $table ) {
-			if ( strpos( $table, $this->temp_prefix ) === false ) {
+			if ( strpos( $table, $this->temp_prefix ) === false &&
+				 strpos( $table, $this->backup_marker ) === false ) {
 				$tables[] = $table;
 			}
 		}
@@ -520,6 +522,8 @@ class SYNC_Core {
 
 		if ( ! file_exists( $backup_dir ) ) {
 			wp_mkdir_p( $backup_dir );
+			file_put_contents( $backup_dir . '/index.php', '<?php // Silence is golden' );
+			file_put_contents( $backup_dir . '/.htaccess', "Options -Indexes\nDeny from all\n" );
 		}
 
 		// Check available disk space before writing
@@ -743,6 +747,17 @@ class SYNC_Core {
 		// Finalize succeeded; clear guard.
 		delete_option( $this->finalize_guard_option );
 
+		// Drop all backup tables — current migration's and any stale ones from prior runs.
+		$backup_tables = $wpdb->get_col( $wpdb->prepare(
+			"SELECT table_name FROM information_schema.tables WHERE table_schema = %s AND table_name LIKE %s",
+			DB_NAME,
+			'%' . $wpdb->esc_like( $this->backup_marker ) . '%'
+		) );
+		foreach ( $backup_tables as $bt ) {
+			$wpdb->query( "DROP TABLE IF EXISTS `{$bt}`" );
+			$this->log_activity( "Dropped backup table: {$bt}" );
+		}
+
 		$this->log_activity( "Flushing rewrite rules" );
 		flush_rewrite_rules( true );
 
@@ -875,7 +890,7 @@ class SYNC_Core {
 	private function make_backup_table_name( $original_table, $suffix ) {
 		// MySQL table name limit is 64 chars.
 		$max = 64;
-		$addon = '_wpsdb_old_' . $suffix;
+		$addon = $this->backup_marker . $suffix;
 		$base = $original_table;
 
 		// Reserve room for addon.

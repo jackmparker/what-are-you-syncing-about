@@ -6,7 +6,8 @@
  * Version: 1.2.0
  * Author: Jack Parker
  * Author URI: https://github.com/jackmparker
- * License: GPL v3
+ * License: GPLv3
+ * License URI: https://www.gnu.org/licenses/gpl-3.0.html
  * Network: True
  * Text Domain: what-are-you-syncing-about
  */
@@ -130,8 +131,12 @@ register_activation_hook( __FILE__, function() {
 	$backup_dir = $upload_dir['basedir'] . '/what-are-you-syncing-about';
 	if ( ! file_exists( $backup_dir ) ) {
 		wp_mkdir_p( $backup_dir );
-		// Create index.php to prevent directory listing
 		file_put_contents( $backup_dir . '/index.php', '<?php // Silence is golden' );
+	}
+	// Block direct HTTP access to backup files on Apache.
+	$htaccess = $backup_dir . '/.htaccess';
+	if ( ! file_exists( $htaccess ) ) {
+		file_put_contents( $htaccess, "Options -Indexes\nDeny from all\n" );
 	}
 } );
 

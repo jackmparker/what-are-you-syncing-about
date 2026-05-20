@@ -119,16 +119,16 @@ $concurrency     = isset( $settings['concurrency'] ) ? (int) $settings['concurre
 		<div class="sync-section">
 			<h2><?php echo esc_html__( 'Migration Actions', 'what-are-you-syncing-about' ); ?></h2>
 			<p class="description">
-				<?php echo esc_html__( 'Pull database from remote site or push database to remote site.', 'what-are-you-syncing-about' ); ?>
+				<?php echo esc_html__( 'Choose what to sync, then pull from or push to the remote site.', 'what-are-you-syncing-about' ); ?>
 			</p>
 			<div class="sync-file-options">
 				<label>
-					<input type="checkbox" id="sync-plugins" />
-					<?php echo esc_html__( 'Sync plugins (wp-content/plugins)', 'what-are-you-syncing-about' ); ?>
+					<input type="checkbox" id="sync-database" checked />
+					<?php echo esc_html__( 'Sync database', 'what-are-you-syncing-about' ); ?>
 				</label>
 				<label>
 					<input type="checkbox" id="sync-uploads" />
-					<?php echo esc_html__( 'Sync uploads (wp-content/uploads, skips unchanged files)', 'what-are-you-syncing-about' ); ?>
+					<?php echo esc_html__( 'Sync media (wp-content/uploads, skips unchanged files)', 'what-are-you-syncing-about' ); ?>
 				</label>
 			</div>
 			<div class="migration-actions">
